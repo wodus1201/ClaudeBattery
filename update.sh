@@ -12,14 +12,23 @@ git pull --ff-only
 
 echo "==> 2/3  Rebuilding for this machine"
 # Stop the running instance first so the app bundle isn't file-locked mid-build.
-launchctl unload "$PLIST" 2>/dev/null || true
 pkill -x ClaudeBattery 2>/dev/null || true
 sleep 1
 ./build.sh
 
-echo "==> 3/3  Restarting"
+echo "==> 3/3  Restarting with the new binary"
 if [ -f "$PLIST" ]; then
-  launchctl load -w "$PLIST"
+  # `kickstart -k` force-kills the current process and relaunches it from the
+  # (freshly rebuilt) binary. This is reliable, unlike `launchctl load` which
+  # silently no-ops when the service is already registered — that was why an
+  # update rebuilt the code but the menu bar kept showing the old version.
+  if launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null; then
+    :
+  else
+    # Service wasn't registered yet (e.g. first run) — register it now.
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
+      || launchctl load -w "$PLIST" 2>/dev/null || true
+  fi
 else
   echo "    (LaunchAgent not found — run ./install.sh first for auto-start)"
 fi

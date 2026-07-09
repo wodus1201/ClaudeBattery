@@ -52,8 +52,13 @@ cat > "$PLIST" <<PLISTEOF
 PLISTEOF
 
 echo "==> 5/5  Starting"
-launchctl unload "$PLIST" 2>/dev/null || true
-launchctl load -w "$PLIST"
+# Fully re-register: bootout removes any existing registration (modern API),
+# then bootstrap loads the fresh plist. Falls back to legacy load if needed.
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
+  || { launchctl unload "$PLIST" 2>/dev/null || true; launchctl load -w "$PLIST"; }
+# Ensure it's running the just-built binary right now.
+launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
 
 echo ""
 echo "✅  Done. Look at the right side of your menu bar for the 클로드 HP widget."
