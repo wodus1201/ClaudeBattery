@@ -34,7 +34,17 @@ cd ClaudeBattery
 
 첫 실행 때 **"Keychain 접근을 허용하시겠습니까"** 팝업이 뜨면 **"항상 허용"**을 누르세요. (Claude Code 로그인 토큰을 읽기 위함이며, 토큰을 외부로 전송하지 않습니다 — 아래 "동작 원리" 참고.)
 
-설치가 끝나면 메뉴바 오른쪽에 클로드 HP 위젯이 뜹니다.
+설치가 끝나면 메뉴바 오른쪽에 클로드 HP 위젯이 뜁니다.
+
+### 나중에 업데이트하려면
+
+이 앱은 App Store처럼 자동 업데이트되지 않습니다 (소스 배포 방식). 개발 맥에서 새 코드를 GitHub에 `push`하면, **사용 중인 맥에서 아래 한 줄**로 최신 버전을 받습니다:
+
+```bash
+cd ~/ClaudeBattery && ./update.sh
+```
+
+`update.sh`가 `git pull` → 그 맥에 맞게 재빌드 → 위젯 재시작까지 한 번에 처리합니다.
 
 ---
 
@@ -42,9 +52,11 @@ cd ClaudeBattery
 
 | 하고 싶은 것 | 명령어 |
 |---|---|
+| **최신 버전으로 업데이트** | `cd ~/ClaudeBattery && ./update.sh` |
 | 코드 수정 후 반영 | `cd ~/ClaudeBattery && ./build.sh && launchctl kickstart -k gui/$(id -u)/com.jay.ClaudeBattery` |
 | 지금 당장 새로고침 | 메뉴바 위젯 클릭 → "지금 새로고침" |
 | 추적할 한도 바꾸기 (세션/주간/Fable) | 메뉴바 위젯 클릭 → 원하는 항목 클릭 (✓ 표시로 확인, 재시작해도 유지됨) |
+| 간결/상세 모드 전환 (메뉴바 폭) | 메뉴바 위젯 클릭 → "간결 모드" 체크 토글 (재시작해도 유지됨) |
 | 앱이 도는지 확인 | `pgrep -x ClaudeBattery` |
 | 완전히 제거 | `cd ~/ClaudeBattery && ./uninstall.sh` |
 

@@ -348,6 +348,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Which limit the widget tracks. Default = 5-hour session; user can switch
     // from the click menu, and the choice persists across restarts.
     var selectedKind: String = UserDefaults.standard.string(forKey: "selectedKind") ?? "session"
+    // Compact mode: hides "Lv--" and shrinks the dialogue slot, so the widget
+    // fits menu bars with limited space (e.g. MacBook Pro w/ many other icons)
+    // instead of being pushed into the ">>" overflow. Default ON; togglable
+    // from the click menu; persists across restarts.
+    var compact: Bool = UserDefaults.standard.object(forKey: "compact") as? Bool ?? true
     var hasData = false
     var lastSignature = ""
 
@@ -477,13 +482,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             (primary, secondary, alpha) = slotTexts(elapsed: elapsed, remaining: remaining)
         }
 
-        let sig = "\(used)|\(hpUnknown)|\(bob)|\(blink)|sleep=\(sleeping)|\(primary)|\(secondary ?? "")|\(Int(alpha * 12))"
+        let sig = "\(used)|\(hpUnknown)|\(bob)|\(blink)|sleep=\(sleeping)|\(compact)|\(primary)|\(secondary ?? "")|\(Int(alpha * 12))"
         if sig == lastSignature { return }
         lastSignature = sig
 
         let img = buildImage(used: used, remaining: remaining, bob: CGFloat(bob),
                              blink: blink, primary: primary, secondary: secondary, alpha: alpha,
-                             sleeping: sleeping, hpUnknown: hpUnknown)
+                             sleeping: sleeping, hpUnknown: hpUnknown, compact: compact)
         statusItem.button?.attributedTitle = NSAttributedString(string: "")
         statusItem.button?.image = img
         statusItem.button?.imagePosition = .imageOnly
@@ -491,7 +496,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func buildImage(used: Int, remaining: Int, bob: CGFloat, blink: Bool,
                     primary: String, secondary: String?, alpha: CGFloat,
-                    sleeping: Bool = false, hpUnknown: Bool = false) -> NSImage {
+                    sleeping: Bool = false, hpUnknown: Bool = false, compact: Bool = false) -> NSImage {
         // When HP is unknown (dozing before any data), the gauge is empty gray.
         let frac: CGFloat = hpUnknown ? 1 : CGFloat(remaining) / 100.0
         // Gauge turns gray while dozing.
@@ -507,10 +512,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let lvAttr: [NSAttributedString.Key: Any]   = [.font: pixelFont(12), .foregroundColor: black]
         let hpTextAttr: [NSAttributedString.Key: Any] = [.font: pixelFont(13), .foregroundColor: black]
         let hpLabelAttr: [NSAttributedString.Key: Any] = [.font: pixelFont(10), .foregroundColor: NSColor.systemYellow]
-        let slotFont = pixelFont(12)
+        // Compact mode shrinks the dialogue-slot font so long sentences take less room.
+        let slotFont = pixelFont(compact ? 9 : 12)
 
         let nameSize = (name as NSString).size(withAttributes: nameAttr)
-        let lvSize = (lv as NSString).size(withAttributes: lvAttr)
+        // Compact mode hides "Lv--" entirely (zero width) to save space.
+        let lvSize = compact ? .zero : (lv as NSString).size(withAttributes: lvAttr)
         let hpTextSize = (hpText as NSString).size(withAttributes: hpTextAttr)
         let hpLabelSize = (hpLabel as NSString).size(withAttributes: hpLabelAttr)
 
@@ -538,7 +545,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let flavorGap: CGFloat = 10
         let height = NSStatusBar.system.thickness
 
-        let contentW = spriteW + gap + nameSize.width + gap + lvSize.width + gap
+        let lvBlockW = compact ? 0 : lvSize.width + gap   // Lv text + its trailing gap, omitted when compact
+        let contentW = spriteW + spriteNameGap + nameSize.width + gap + lvBlockW
             + hpUnitW + gap + hpTextSize.width + flavorGap + slotW
         let totalW = ceil(contentW + padX * 2)
 
@@ -566,7 +574,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             drawText(name, nameAttr, nameSize); x += gap
-            drawText(lv, lvAttr, lvSize); x += gap
+            if !compact { drawText(lv, lvAttr, lvSize); x += gap }   // "Lv--" hidden in compact mode
 
             // Fused HP unit: single rounded pill, black "HP" cap + white gauge; only inner fill is colored.
             let unit = NSRect(x: x, y: midY - unitH / 2, width: hpUnitW, height: unitH)
@@ -642,7 +650,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if result.rateLimited {
             // Show the dozing widget in ALL cases — with prior data (gray bar at last
             // HP) or without (placeholder --/100). Never fall back to plain text.
-            statusItem.menu = errorMenu("요청이 많아 잠시 쉬는 중이에요.\n곧 자동으로 다시 시도합니다.")
+            statusItem.menu = errorMenu("요청이 많아 잠시 쉬는 중이에요.\n곧 자동으로 다시 시도합니다.", showCompactToggle: true)
             sleeping = true
             lastSignature = ""
             renderNow()
@@ -733,6 +741,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(.separator())
         }
 
+        let compactItem = NSMenuItem(title: "간결 모드 (메뉴바 폭 줄이기)",
+                                     action: #selector(toggleCompact), keyEquivalent: "")
+        compactItem.target = self
+        compactItem.state = compact ? .on : .off
+        menu.addItem(compactItem)
+        menu.addItem(.separator())
+
         let refreshItem = NSMenuItem(title: "지금 새로고침", action: #selector(refreshNow), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
@@ -742,7 +757,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return menu
     }
 
-    func errorMenu(_ msg: String) -> NSMenu {
+    /// Menu action: toggle compact mode (hides Lv, shrinks the dialogue font)
+    /// so the widget fits menu bars with limited space; choice persists.
+    @objc func toggleCompact() {
+        compact.toggle()
+        UserDefaults.standard.set(compact, forKey: "compact")
+        lastSignature = ""
+        renderNow()
+        statusItem.menu = usageMenu(last)   // rebuild to move the checkmark
+    }
+
+    func errorMenu(_ msg: String, showCompactToggle: Bool = false) -> NSMenu {
         let menu = NSMenu()
         let item = NSMenuItem(title: "오류: \(msg)", action: nil, keyEquivalent: "")
         item.isEnabled = false
@@ -751,6 +776,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         hint.isEnabled = false
         menu.addItem(hint)
         menu.addItem(.separator())
+        if showCompactToggle {
+            let compactItem = NSMenuItem(title: "간결 모드 (메뉴바 폭 줄이기)",
+                                         action: #selector(toggleCompact), keyEquivalent: "")
+            compactItem.target = self
+            compactItem.state = compact ? .on : .off
+            menu.addItem(compactItem)
+            menu.addItem(.separator())
+        }
         let refreshItem = NSMenuItem(title: "다시 시도", action: #selector(refreshNow), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
