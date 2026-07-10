@@ -1,8 +1,9 @@
 #!/bin/bash
-# Claude Battery — stop the widget and keep it stopped.
-# Unlike `pkill` (which launchd immediately revives), this unregisters the
-# service so it stays off until you run ./start.sh (or log in again with the
-# plist still installed). Use ./uninstall.sh to also disable login auto-start.
+# Claude Battery — stop the widget.
+#
+# Auto-start now lives in SMAppService (the "로그인 시 자동 시작" menu toggle),
+# not in a LaunchAgent, so nothing revives the app after this. The bootout is
+# only here to quiet a leftover agent from a pre-1.1 install.
 set -euo pipefail
 LABEL="com.jay.ClaudeBattery"
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true

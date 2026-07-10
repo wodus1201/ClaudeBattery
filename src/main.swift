@@ -1,5 +1,6 @@
 import Cocoa
 import CoreText
+import ServiceManagement
 
 // ── Claude Battery ─────────────────────────────────────────────────────────
 // Personal macOS menu-bar app showing your real Claude usage limits, using the
@@ -14,6 +15,17 @@ let KEYCHAIN_SERVICE = "Claude Code-credentials"
 let REFRESH_SECONDS: TimeInterval = 240      // 4 min — gentle on the usage endpoint
 let MAX_BACKOFF: TimeInterval = 1800         // cap backoff at 30 min
 let PIXEL_FONT_NAME = "NeoDunggeunmo"
+
+// Self-update: we poll the GitHub Releases API and swap the .app bundle in place.
+// The release tag must be the version with a leading "v" (v1.1 ⇒ VERSION 1.1),
+// and the release must carry a ClaudeBattery.zip asset. ./release.sh does both.
+let REPO = "wodus1201/ClaudeBattery"
+let RELEASES_API = "https://api.github.com/repos/\(REPO)/releases/latest"
+let RELEASES_PAGE = "https://github.com/\(REPO)/releases/latest"
+let UPDATE_CHECK_INTERVAL: TimeInterval = 6 * 3600   // once every 6 hours
+
+/// This build's version, from Info.plist (injected by build.sh from ./VERSION).
+let APP_VERSION = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
 
 // MARK: - Pixel font
 
@@ -48,6 +60,44 @@ func flavorLine(remaining: Int) -> String {
 /// Shown in the dialogue slot while rate-limited (429): the app is dozing.
 let SLEEP_MESSAGE = "클로드가 졸고 있다. 깨우지 말자.."
 
+// MARK: - Petting (sprite click) lines
+// Tone borrowed from Pokémon-Amie affection messages. Keyed off the same Mood
+// that drives the HP-bar color, so the line always matches what the bar shows:
+// lively when healthy, needy when hurt, unresponsive when fainted.
+
+func pettingLines(mood: Mood) -> [String] {
+    switch mood {
+    case .healthy: return [          // green bar
+        "클로드가 기뻐서 빙글빙글 돈다!",
+        "클로드가 몸을 부비부비 해온다!",
+        "클로드가 폴짝폴짝 뛰어오른다!",
+        "클로드가 활짝 웃으며 올려다본다!",
+        "클로드는 무척 행복해 보인다!",
+    ]
+    case .tired: return [            // orange bar
+        "클로드가 기분 좋은 듯 눈을 감는다.",
+        "클로드가 살며시 다가와 앉는다.",
+        "클로드가 꼬리를 살랑살랑 흔든다.",
+        "클로드가 나른하게 웃어 보인다.",
+    ]
+    case .hurt: return [             // red bar
+        "클로드가 힘없이 몸을 기대온다..",
+        "클로드가 당신의 손을 꼭 잡는다..",
+        "클로드가 조금 기운을 낸 것 같다.",
+        "클로드가 애써 미소를 지어 보인다..",
+    ]
+    case .fainted: return [
+        "클로드는 쓰러져서 반응이 없다..",
+        "클로드를 포켓몬센터에 데려가자..",
+    ]
+    // .happy is the reaction itself, never the state we react from.
+    case .happy: return pettingLines(mood: .healthy)
+    }
+}
+
+/// How long a petting reaction stays on screen before the normal slot cycle resumes.
+let PETTING_HOLD: TimeInterval = 3.0
+
 /// Korean "time until the Pokémon Center" (i.e. until the limit resets).
 func resetKorean(_ date: Date?) -> String {
     guard let date = date else { return "알 수 없음" }
@@ -63,6 +113,9 @@ func resetKorean(_ date: Date?) -> String {
 /// slot width so the widget never reflows when the text swaps or the clock ticks.
 func allSlotStrings() -> [String] {
     var s = [90, 70, 45, 25, 10, 5, 0].map { flavorLine(remaining: $0) }
+    // Sprite-click reactions share the same slot, so reserve room for them too.
+    s += [Mood.healthy, .tired, .hurt, .fainted].flatMap { pettingLines(mood: $0) }
+    s.append(SLEEP_MESSAGE)
     // Longest plausible countdown renderings.
     s += ["포켓몬센터까지 23시간 59분", "포켓몬센터까지 6일 23시간"]
     return s
@@ -70,7 +123,7 @@ func allSlotStrings() -> [String] {
 
 // MARK: - Claude pixel sprite
 
-enum Mood { case healthy, tired, hurt, fainted }
+enum Mood { case healthy, tired, hurt, fainted, happy }
 
 func mood(remaining: Int) -> Mood {
     if remaining >= 50 { return .healthy }   // green
@@ -97,23 +150,23 @@ let spriteColorsFainted: [Character: NSColor] = [
     "M": NSColor(calibratedWhite: 0.30, alpha: 1),
 ]
 
-// Official-style Clawd: 15 cols x 14 rows. The body/ears/arms/legs are constant;
+// Official-style Clawd: 20 cols x 14 rows. The body/ears/arms/legs are constant;
 // only the two eye rows (index 5,6) change per mood. Row 0 = top.
 let clawdBase: [String] = [
-    ".....DBBBBBBBD.....",
-    "....DBDBBBBBDBD....",
-    "..DBBBBBBBBBBBBBD..",
-    "..DBBBBBBBBBBBBBD..",
-    "..DBBBBBBBBBBBBBD..",
-    "..DBBBBBBBBBBBBBD..",   // eyes row (5) — replaced per mood
-    "..DBBBBBBBBBBBBBD..",   // eyes row (6) — replaced per mood
-    "DDBBBBBBBBBBBBBBBDD",   // arms
-    "DDBBBBBBBBBBBBBBBDD",   // arms
-    "..DBBBBBBBBBBBBBD..",
-    "..DBBBBBBBBBBBBBD..",
-    "..DBBBBBBBBBBBBBD..",
-    "....DBD....DBD....",
-    "....DBD....DBD....",
+    ".....DBBBBBBBBD.....",
+    "....DBDBBBBBBDBD....",
+    "..DBBBBBBBBBBBBBBD..",
+    "..DBBBBBBBBBBBBBBD..",
+    "..DBBBBBBBBBBBBBBD..",
+    "..DBBBBBBBBBBBBBBD..",   // eyes row (5) — replaced per mood
+    "..DBBBBBBBBBBBBBBD..",   // eyes row (6) — replaced per mood
+    "DDBBBBBBBBBBBBBBBBDD",   // arms
+    "DDBBBBBBBBBBBBBBBBDD",   // arms
+    "..DBBBBBBBBBBBBBBD..",
+    "..DBBBBBBBBBBBBBBD..",
+    "..DBBBBBBBBBBBBBBD..",
+    "...DB..BD..BD..BD...",
+    "...DB..BD..BD..BD...",
 ]
 
 func makeFace(_ eyeRow5: String, _ eyeRow6: String) -> [String] {
@@ -127,22 +180,27 @@ func makeFace(_ eyeRow5: String, _ eyeRow6: String) -> [String] {
 let spriteGrids: [Mood: [[String]]] = [
     // content: open eyes; blink: eyes closed
     .healthy: [
-        makeFace("..DBBKKBBBBBKKBBD..", "..DBBKKBBBBBKKBBD.."),
-        makeFace("..DBBBBBBBBBBBBBD..", "..DBBKKBBBBBKKBBD.."),
+        makeFace("..DBBBKKBBBBKKBBBD..", "..DBBBKKBBBBKKBBBD.."),
+        makeFace("..DBBBBBBBBBBBBBBD..", "..DBBBKKBBBBKKBBBD.."),
     ],
     // tired: half-lidded (single row) + sweat drop at top-right
     .tired: [
-        makeFace("..DBKKKBBBBBKKKBD..", "..DBBKKBBBBBKKBBD.."),
-        makeFace("..DBBBBBBBBBBBBBD..", "..DBKKKBBBBBKKKBD.."),
+        makeFace("..DBBKKKBBBBKKKBBD..", "..DBBBKKBBBBKKBBBD.."),
+        makeFace("..DBBBBBBBBBBBBBBD..", "..DBBKKKBBBBKKKBBD.."),
     ],
     // hurt: wide worried eyes + teardrop
     .hurt: [
-        makeFace("..DBBKKBBBBBKKBBD..", "..DTTKKBBBBBKKTTD.."),
-        makeFace("..DBBBBBBBBBBBBBD..", "..DTTKKBBBBBKKTTD.."),
+        makeFace("..DBBBKKBBBBKKBBBD..", "..DBTTKKBBBBKKTTBD.."),
+        makeFace("..DBBBBBBBBBBBBBBD..", "..DBTTKKBBBBKKTTBD.."),
     ],
     // fainted: X-shaped eyes
     .fainted: [
-        makeFace("..DBBBBBBBBBBBBBD..", "..DBKKKBBBBBKKKBD.."),
+        makeFace("..DBBBBBBBBBBBBBBD..", "..DBBKKKBBBBKKKBBD.."),
+    ],
+    // happy (sprite clicked): upturned "^ ^" eyes. Single frame — no blink, so
+    // the smile holds steady for the whole petting window.
+    .happy: [
+        makeFace("..DBBBBKBBBBKBBBBD..", "..DBBBKBKBBKBKBBBD.."),
     ],
 ]
 
@@ -282,6 +340,162 @@ func parseUsage(_ data: Data) -> UsageResult {
     return result
 }
 
+// MARK: - Self-update
+
+/// Compare dotted versions numerically: "1.10" is newer than "1.9",
+/// which a plain string compare would get backwards.
+func isNewer(_ candidate: String, than current: String) -> Bool {
+    func parts(_ s: String) -> [Int] {
+        s.split(separator: ".").map { Int($0.filter(\.isNumber)) ?? 0 }
+    }
+    let a = parts(candidate), b = parts(current)
+    for i in 0..<max(a.count, b.count) {
+        let x = i < a.count ? a[i] : 0
+        let y = i < b.count ? b[i] : 0
+        if x != y { return x > y }
+    }
+    return false
+}
+
+struct Release {
+    let version: String   // tag without the leading "v"
+    let zipURL: URL
+}
+
+/// Ask GitHub for the latest release. Returns nil on any failure — a missing
+/// network or a rate-limited API must never disturb the widget.
+func fetchLatestRelease(completion: @escaping (Release?) -> Void) {
+    guard let url = URL(string: RELEASES_API) else { completion(nil); return }
+    var req = URLRequest(url: url)
+    req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+    req.timeoutInterval = 10
+
+    URLSession.shared.dataTask(with: req) { data, resp, _ in
+        guard let data = data,
+              let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tag = obj["tag_name"] as? String,
+              let assets = obj["assets"] as? [[String: Any]]
+        else { completion(nil); return }
+
+        // The .app is shipped as a zip asset; without it there's nothing to install.
+        let zip = assets.first { ($0["name"] as? String)?.hasSuffix(".zip") == true }
+        guard let urlStr = zip?["browser_download_url"] as? String,
+              let zipURL = URL(string: urlStr)
+        else { completion(nil); return }
+
+        let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        completion(Release(version: version, zipURL: zipURL))
+    }.resume()
+}
+
+enum UpdateError: LocalizedError {
+    case download(String), unpack, noBundle, notWritable(String), devBuild
+    var errorDescription: String? {
+        switch self {
+        case .download(let m): return "다운로드 실패: \(m)"
+        case .unpack:          return "압축 해제 실패"
+        case .noBundle:        return "새 앱을 찾을 수 없습니다"
+        case .notWritable(let p): return "쓰기 권한 없음: \(p)"
+        case .devBuild:
+            return "개발 빌드(build/)는 자동 업데이트를 지원하지 않습니다.\n"
+                 + "소스에서는 git pull && ./build.sh 를 사용하세요."
+        }
+    }
+}
+
+/// Download the release zip, unpack it, then hand off to a detached script that
+/// swaps the bundle and relaunches. We cannot overwrite our own bundle while
+/// running, so the script waits for this process to exit first.
+func installUpdate(_ release: Release, completion: @escaping (Error?) -> Void) {
+    // The running bundle may be reached via the /Applications symlink that
+    // install.sh creates; resolve it so we replace the real directory.
+    let installedApp = Bundle.main.bundleURL.resolvingSymlinksInPath()
+    let parent = installedApp.deletingLastPathComponent()
+
+    // Resolving that symlink can land us inside the source checkout's build/
+    // directory. Overwriting a build artifact with a release zip would just
+    // confuse the next ./build.sh, so refuse and point at the git workflow.
+    guard parent.lastPathComponent != "build" else {
+        completion(UpdateError.devBuild); return
+    }
+    guard FileManager.default.isWritableFile(atPath: parent.path) else {
+        completion(UpdateError.notWritable(parent.path)); return
+    }
+
+    URLSession.shared.downloadTask(with: release.zipURL) { tmp, _, err in
+        if let err = err { completion(UpdateError.download(err.localizedDescription)); return }
+        guard let tmp = tmp else { completion(UpdateError.download("빈 응답")); return }
+
+        let fm = FileManager.default
+        let work = fm.temporaryDirectory.appendingPathComponent("ClaudeBatteryUpdate-\(UUID().uuidString)")
+        do {
+            try fm.createDirectory(at: work, withIntermediateDirectories: true)
+            let zip = work.appendingPathComponent("update.zip")
+            try fm.moveItem(at: tmp, to: zip)
+
+            // ditto preserves the bundle's symlinks and signature layout; unzip does not.
+            let unzip = Process()
+            unzip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            unzip.arguments = ["-x", "-k", zip.path, work.path]
+            try unzip.run()
+            unzip.waitUntilExit()
+            guard unzip.terminationStatus == 0 else { completion(UpdateError.unpack); return }
+
+            // Find the .app the archive contains (name may differ from ours).
+            let newApp = try fm.contentsOfDirectory(at: work, includingPropertiesForKeys: nil)
+                .first { $0.pathExtension == "app" }
+            guard let newApp = newApp else { completion(UpdateError.noBundle); return }
+
+            try writeAndRunSwapScript(newApp: newApp, installedApp: installedApp, work: work)
+            completion(nil)   // caller quits; the script takes over from here
+        } catch {
+            completion(error)
+        }
+    }.resume()
+}
+
+/// Write a detached script that waits for us to quit, swaps the bundle, and
+/// relaunches. Detaching matters: it must outlive the process it replaces.
+private func writeAndRunSwapScript(newApp: URL, installedApp: URL, work: URL) throws {
+    let script = work.appendingPathComponent("swap.sh")
+    let body = """
+    #!/bin/bash
+    # Wait (up to ~10s) for ClaudeBattery to exit before touching its bundle.
+    for _ in $(seq 1 100); do
+      pgrep -x ClaudeBattery >/dev/null || break
+      sleep 0.1
+    done
+    pkill -x ClaudeBattery 2>/dev/null || true
+    sleep 0.3
+
+    # Keep the old bundle until the new one is in place, so a failure is recoverable.
+    BACKUP="\(installedApp.path).bak"
+    rm -rf "$BACKUP"
+    mv "\(installedApp.path)" "$BACKUP" 2>/dev/null || true
+    if ! mv "\(newApp.path)" "\(installedApp.path)"; then
+      mv "$BACKUP" "\(installedApp.path)" 2>/dev/null || true   # roll back
+      rm -rf "\(work.path)"
+      exit 1
+    fi
+    rm -rf "$BACKUP"
+
+    # Re-sign ad-hoc: the zip round-trip and mv can invalidate the signature.
+    codesign --force --sign - "\(installedApp.path)" 2>/dev/null || true
+    xattr -dr com.apple.quarantine "\(installedApp.path)" 2>/dev/null || true
+
+    open "\(installedApp.path)"
+    rm -rf "\(work.path)"
+    """
+    try body.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/bash")
+    p.arguments = [script.path]
+    try p.run()   // detached: we exit right after, it keeps going
+}
+
 // MARK: - Presentation helpers
 
 func label(for l: Limit) -> String {
@@ -356,6 +570,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var hasData = false
     var lastSignature = ""
 
+    // Sprite-click ("petting") interaction. The status item has no attached menu
+    // — the button action routes clicks by x-position — so we stash the menu the
+    // button should pop up when the click lands outside the sprite.
+    var currentMenu: NSMenu?
+    var pettingUntil: Date?          // non-nil while the happy face + line show
+    var pettingLine: String = ""
+    var lastPettingLine: String = "" // avoid repeating a line back-to-back
+    /// Sprite hit box in button coordinates, recorded at draw time.
+    var spriteHitMaxX: CGFloat = 0
+
+    // Self-update state
+    var updateTimer: Timer?
+    var availableUpdate: Release?    // non-nil once a newer release is seen
+    var isUpdating = false           // guards against a double-click on 업데이트
+
     // Text-slot timing (seconds)
     let TIME_HOLD = 5.0             // how long the reset-countdown shows
     let FLAVOR_HOLD = 5.0            // how long the flavor line shows
@@ -370,6 +599,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // No statusItem.menu: we handle clicks ourselves so a click on the sprite
+        // can pet Claude instead of opening the menu. See buttonClicked().
+        if let b = statusItem.button {
+            b.target = self
+            b.action = #selector(buttonClicked(_:))
+            b.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
         setTitle(text: " 클로드 …", color: .secondaryLabelColor)
         // ~12fps animation loop; renderNow() is a no-op cheap-skip when nothing changed.
         animTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
@@ -385,7 +621,126 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             applyMock()
             return
         }
+        retireLegacyLaunchAgent()
         refresh()
+        scheduleUpdateChecks()
+    }
+
+    // MARK: - Self-update
+
+    /// Check shortly after launch, then every UPDATE_CHECK_INTERVAL.
+    func scheduleUpdateChecks() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            self?.checkForUpdate(userInitiated: false)
+        }
+        updateTimer = Timer.scheduledTimer(withTimeInterval: UPDATE_CHECK_INTERVAL,
+                                           repeats: true) { [weak self] _ in
+            self?.checkForUpdate(userInitiated: false)
+        }
+    }
+
+    /// A background check only annotates the menu; a user-initiated one always
+    /// reports back, including "you're already up to date".
+    func checkForUpdate(userInitiated: Bool) {
+        fetchLatestRelease { [weak self] release in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                let newer = release.map { isNewer($0.version, than: APP_VERSION) } ?? false
+                self.availableUpdate = newer ? release : nil
+                self.rebuildMenu()
+
+                guard userInitiated else { return }
+                if release == nil {
+                    self.alert("업데이트 확인 실패", "네트워크 상태를 확인해 주세요.")
+                } else if !newer {
+                    self.alert("최신 버전입니다", "현재 버전 \(APP_VERSION)")
+                }
+                // If newer, the menu now shows the update item — no popup needed.
+            }
+        }
+    }
+
+    /// Menu action: download + swap + relaunch, with a confirmation first.
+    @objc func installUpdateNow() {
+        guard let release = availableUpdate, !isUpdating else { return }
+
+        let a = NSAlert()
+        a.messageText = "새 버전 \(release.version) 설치"
+        a.informativeText = "다운로드 후 앱이 자동으로 재시작됩니다."
+        a.addButton(withTitle: "설치")
+        a.addButton(withTitle: "취소")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+
+        isUpdating = true
+        rebuildMenu()
+        installUpdate(release) { [weak self] err in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if let err = err {
+                    self.isUpdating = false
+                    self.rebuildMenu()
+                    self.alert("업데이트 실패", err.localizedDescription)
+                } else {
+                    // The swap script is waiting for us to exit.
+                    NSApp.terminate(nil)
+                }
+            }
+        }
+    }
+
+    /// Menu action: user asked to check right now.
+    @objc func checkForUpdateNow() { checkForUpdate(userInitiated: true) }
+
+    private func alert(_ title: String, _ body: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = body
+        a.addButton(withTitle: "확인")
+        NSApp.activate(ignoringOtherApps: true)
+        a.runModal()
+    }
+
+    // MARK: - Launch at login
+
+    /// Whether macOS currently launches us at login (SMAppService, macOS 13+).
+    var launchAtLogin: Bool { SMAppService.mainApp.status == .enabled }
+
+    @objc func toggleLaunchAtLogin() {
+        do {
+            if launchAtLogin { try SMAppService.mainApp.unregister() }
+            else             { try SMAppService.mainApp.register() }
+        } catch {
+            alert("자동 시작 설정 실패", error.localizedDescription)
+        }
+        rebuildMenu()
+    }
+
+    /// install.sh (pre-1.1) registered a LaunchAgent that starts the binary in
+    /// the source tree. Left in place it fights SMAppService and launches a
+    /// second copy, so retire it and carry its auto-start intent over to
+    /// SMAppService — the user shouldn't silently lose launch-at-login.
+    func retireLegacyLaunchAgent() {
+        let plist = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/com.jay.ClaudeBattery.plist")
+        guard FileManager.default.fileExists(atPath: plist.path) else { return }
+
+        let uid = getuid()
+        let boot = Process()
+        boot.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        boot.arguments = ["bootout", "gui/\(uid)/com.jay.ClaudeBattery"]
+        try? boot.run()
+        boot.waitUntilExit()
+        try? FileManager.default.removeItem(at: plist)
+
+        // The plist existed, so auto-start was wanted. Re-express that through
+        // SMAppService, which the menu toggle now owns. Only meaningful for an
+        // installed bundle; a build/ copy would register the wrong path.
+        let parent = Bundle.main.bundleURL.resolvingSymlinksInPath()
+            .deletingLastPathComponent().lastPathComponent
+        if parent != "build", !launchAtLogin {
+            try? SMAppService.mainApp.register()
+        }
     }
 
     /// Feeds fixture data through the exact same `apply()` path real data uses,
@@ -468,6 +823,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let isFainted = !hpUnknown && remaining == 0
 
+        // Petting expires on its own; clear it so the normal cycle resumes.
+        if let until = pettingUntil, Date() >= until { pettingUntil = nil }
+        let petting = pettingUntil != nil
+
         let bob = isFainted ? 0 : (animTick / 6) % 2
         let phase = animTick % 24
         var blink = isFainted ? false : (phase == 0 || phase == 1)
@@ -477,18 +836,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Dozing: closed eyes, no swap — just the sleep line.
             blink = true
             primary = SLEEP_MESSAGE; secondary = nil; alpha = 1
+        } else if petting {
+            // Petting: hold the reaction line steady, and never blink away the smile.
+            blink = false
+            primary = pettingLine; secondary = nil; alpha = 1
         } else {
             let elapsed = Date().timeIntervalSince(cycleStart)
             (primary, secondary, alpha) = slotTexts(elapsed: elapsed, remaining: remaining)
         }
 
-        let sig = "\(used)|\(hpUnknown)|\(bob)|\(blink)|sleep=\(sleeping)|\(compact)|\(primary)|\(secondary ?? "")|\(Int(alpha * 12))"
+        let sig = "\(used)|\(hpUnknown)|\(bob)|\(blink)|sleep=\(sleeping)|pet=\(petting)|\(compact)|\(primary)|\(secondary ?? "")|\(Int(alpha * 12))"
         if sig == lastSignature { return }
         lastSignature = sig
 
         let img = buildImage(used: used, remaining: remaining, bob: CGFloat(bob),
                              blink: blink, primary: primary, secondary: secondary, alpha: alpha,
-                             sleeping: sleeping, hpUnknown: hpUnknown, compact: compact)
+                             sleeping: sleeping, hpUnknown: hpUnknown, compact: compact,
+                             petting: petting)
         statusItem.button?.attributedTitle = NSAttributedString(string: "")
         statusItem.button?.image = img
         statusItem.button?.imagePosition = .imageOnly
@@ -496,7 +860,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func buildImage(used: Int, remaining: Int, bob: CGFloat, blink: Bool,
                     primary: String, secondary: String?, alpha: CGFloat,
-                    sleeping: Bool = false, hpUnknown: Bool = false, compact: Bool = false) -> NSImage {
+                    sleeping: Bool = false, hpUnknown: Bool = false, compact: Bool = false,
+                    petting: Bool = false) -> NSImage {
         // When HP is unknown (dozing before any data), the gauge is empty gray.
         let frac: CGFloat = hpUnknown ? 1 : CGFloat(remaining) / 100.0
         // Gauge turns gray while dozing.
@@ -530,7 +895,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let slotW = ceil(slotStrings.map { ($0 as NSString).size(withAttributes: slotAttr).width }.max() ?? 120)
 
         // Sprite geometry
-        let spriteCols: CGFloat = 15
+        let spriteCols: CGFloat = 20
         let spriteRows: CGFloat = 14
         let cell: CGFloat = 1.28
         let spriteW = spriteCols * cell
@@ -541,7 +906,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let unitH: CGFloat = 13
         let padX: CGFloat = 7
         let gap: CGFloat = 5
-        let spriteNameGap: CGFloat = 9   // 스프라이트 ↔ 이름 간격 (이 숫자를 키우면 더 벌어짐)
+        let spriteNameGap: CGFloat = 7   // 스프라이트 ↔ 이름 간격 (이 숫자를 키우면 더 벌어짐)
         let flavorGap: CGFloat = 10
         let height = NSStatusBar.system.thickness
 
@@ -549,6 +914,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let contentW = spriteW + spriteNameGap + nameSize.width + gap + lvBlockW
             + hpUnitW + gap + hpTextSize.width + flavorGap + slotW
         let totalW = ceil(contentW + padX * 2)
+        // Sprite occupies [padX, padX + spriteW] horizontally; remember its right
+        // edge so buttonClicked() can tell a pet from a menu click.
+        spriteHitMaxX = padX + spriteW
 
         let img = NSImage(size: NSSize(width: totalW, height: height), flipped: false) { rect in
             // Off-white rounded background pill.
@@ -560,7 +928,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Sprite (left of the name), with a subtle vertical bob.
             // Unknown HP (dozing pre-data) uses the healthy face so blink = closed eyes.
-            let mood = hpUnknown ? .healthy : mood(remaining: remaining)
+            // Petting smiles — unless Claude has fainted, who stays fainted.
+            var mood = hpUnknown ? .healthy : mood(remaining: remaining)
+            if petting && mood != .fainted { mood = .happy }
             let frames = spriteGrids[mood] ?? spriteGrids[.healthy]!
             let grid = (blink && frames.count > 1) ? frames[1] : frames[0]
             let spriteOrigin = NSPoint(x: x, y: midY - spriteH / 2 + bob)
@@ -585,7 +955,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             black.setFill(); NSRect(x: unit.minX, y: unit.minY, width: labelW, height: unitH).fill()
             NSColor.white.setFill(); NSRect(x: unit.minX + labelW, y: unit.minY, width: gaugePartW, height: unitH).fill()
             let innerInset: CGFloat = 3
-            let innerFull = gaugePartW - innerInset * 2
+            let innerFull = gaugePartW - innerInset
             if frac > 0 {
                 hpColor.setFill()
                 NSRect(x: unit.minX + labelW, y: unit.minY + innerInset,
@@ -650,7 +1020,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if result.rateLimited {
             // Show the dozing widget in ALL cases — with prior data (gray bar at last
             // HP) or without (placeholder --/100). Never fall back to plain text.
-            statusItem.menu = errorMenu("요청이 많아 잠시 쉬는 중이에요.\n곧 자동으로 다시 시도합니다.", showCompactToggle: true)
+            rebuildMenu()
             sleeping = true
             lastSignature = ""
             renderNow()
@@ -658,16 +1028,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         sleeping = false
 
-        if let err = result.error {
+        if result.error != nil {
             hasData = false
             setTitle(text: " C ⚠", color: .systemRed)
-            statusItem.menu = errorMenu(err)
+            rebuildMenu()
             return
         }
 
         lastLimits = result.limits
         updateDriver(resetCycle: false)
-        statusItem.menu = usageMenu(result)
+        rebuildMenu()
     }
 
     /// Point the widget at the currently selected limit (default: 5-hour session).
@@ -689,13 +1059,92 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - Click routing
+
+    /// Clicking the sprite pets Claude; clicking anywhere else opens the menu.
+    @objc func buttonClicked(_ sender: NSStatusBarButton) {
+        let inSprite = NSApp.currentEvent.map { ev -> Bool in
+            let p = sender.convert(ev.locationInWindow, from: nil)
+            return p.x <= spriteHitMaxX
+        } ?? false
+
+        // Petting needs a face to react with; while dozing or error, just menu.
+        if inSprite && hasData && !sleeping {
+            pet()
+        } else if let menu = currentMenu {
+            statusItem.menu = menu          // attach, pop up, then detach so the
+            sender.performClick(nil)        // next plain click reaches us again
+            statusItem.menu = nil
+        }
+    }
+
+    /// Show the happy face + an affection line for PETTING_HOLD seconds.
+    func pet() {
+        let remaining = max(0, min(100, 100 - (driverUsed ?? 0)))
+        var pool = pettingLines(mood: mood(remaining: remaining))
+        if pool.count > 1 { pool.removeAll { $0 == lastPettingLine } }
+        let line = pool.randomElement() ?? lastPettingLine
+        lastPettingLine = line
+        pettingLine = line
+        pettingUntil = Date().addingTimeInterval(PETTING_HOLD)
+        lastSignature = ""      // force an immediate redraw
+        renderNow()
+    }
+
     /// Menu action: switch which limit the widget tracks; remember the choice.
     @objc func selectLimit(_ sender: NSMenuItem) {
         guard let kind = sender.representedObject as? String else { return }
         selectedKind = kind
         UserDefaults.standard.set(kind, forKey: "selectedKind")
         updateDriver(resetCycle: true)
-        statusItem.menu = usageMenu(last)         // rebuild to move the checkmark
+        rebuildMenu()                             // rebuild to move the checkmark
+    }
+
+    /// Rebuild `currentMenu` from the latest result. Anything that changes what
+    /// the menu shows — a new limit selection, an available update, the
+    /// launch-at-login state — funnels through here so all three menu shapes
+    /// (usage / dozing / error) stay in sync.
+    func rebuildMenu() {
+        if last.rateLimited {
+            currentMenu = errorMenu("요청이 많아 잠시 쉬는 중이에요.\n곧 자동으로 다시 시도합니다.",
+                                    showCompactToggle: true)
+        } else if let err = last.error {
+            currentMenu = errorMenu(err)
+        } else {
+            currentMenu = usageMenu(last)
+        }
+    }
+
+    /// Items shared by every menu shape: update status, launch-at-login, quit.
+    func appendCommonItems(to menu: NSMenu) {
+        menu.addItem(.separator())
+
+        if isUpdating {
+            let item = NSMenuItem(title: "업데이트 설치 중…", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        } else if let up = availableUpdate {
+            let item = NSMenuItem(title: "🎁 새 버전 \(up.version) 설치",
+                                  action: #selector(installUpdateNow), keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+        } else {
+            let item = NSMenuItem(title: "업데이트 확인 (v\(APP_VERSION))",
+                                  action: #selector(checkForUpdateNow), keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+        }
+
+        let login = NSMenuItem(title: "로그인 시 자동 시작",
+                               action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        login.target = self
+        login.state = launchAtLogin ? .on : .off
+        menu.addItem(login)
+
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "종료", action: #selector(NSApplication.terminate(_:)),
+                              keyEquivalent: "q")
+        menu.addItem(quit)
     }
 
     func usageMenu(_ result: UsageResult) -> NSMenu {
@@ -752,8 +1201,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refreshItem.target = self
         menu.addItem(refreshItem)
 
-        let quit = NSMenuItem(title: "종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quit)
+        appendCommonItems(to: menu)
         return menu
     }
 
@@ -764,7 +1212,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(compact, forKey: "compact")
         lastSignature = ""
         renderNow()
-        statusItem.menu = usageMenu(last)   // rebuild to move the checkmark
+        rebuildMenu()                       // rebuild to move the checkmark
     }
 
     func errorMenu(_ msg: String, showCompactToggle: Bool = false) -> NSMenu {
@@ -787,8 +1235,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let refreshItem = NSMenuItem(title: "다시 시도", action: #selector(refreshNow), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
-        let quit = NSMenuItem(title: "종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quit)
+        appendCommonItems(to: menu)
         return menu
     }
 
@@ -812,6 +1259,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // dozing WITHOUT data (placeholder --/100)
         imgs.append(buildImage(used: 0, remaining: 0, bob: 0, blink: true,
                                primary: SLEEP_MESSAGE, secondary: nil, alpha: 1, sleeping: true, hpUnknown: true))
+        // petting: healthy Claude smiles
+        imgs.append(buildImage(used: 5, remaining: 95, bob: 0, blink: false,
+                               primary: "클로드가 기뻐서 빙글빙글 돈다!", secondary: nil, alpha: 1,
+                               petting: true))
+        // petting: fainted Claude stays fainted (no smile)
+        imgs.append(buildImage(used: 100, remaining: 0, bob: 0, blink: false,
+                               primary: "클로드는 쓰러져서 반응이 없다..", secondary: nil, alpha: 1,
+                               petting: true))
         let maxW = imgs.map { $0.size.width }.max() ?? 200
         let rowH = NSStatusBar.system.thickness + 4
         let total = NSImage(size: NSSize(width: maxW, height: rowH * CGFloat(imgs.count)), flipped: false) { rect in
