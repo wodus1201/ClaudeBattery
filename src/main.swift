@@ -610,6 +610,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var availableUpdate: Release?    // non-nil once a newer release is seen
     var isUpdating = false           // guards against a double-click on 업데이트
 
+    // Battle screen: the drop-down panel a left-click opens.
+    var battlePanel: BattlePanel?
+    var battleMonitor: Any?          // dismisses the panel on a click elsewhere
+    var escMonitor: Any?
+
     // Text-slot timing (seconds)
     let TIME_HOLD = 5.0             // how long the reset-countdown shows
     let FLAVOR_HOLD = 5.0            // how long the flavor line shows
@@ -621,6 +626,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Debug: CLAUDEMONSTER_DUMP=<path> renders sample frames and exits.
         if let dump = ProcessInfo.processInfo.environment["CLAUDEMONSTER_DUMP"] {
             dumpSamples(to: dump); exit(0)
+        }
+        // Debug: CLAUDEMONSTER_BATTLE=<path> renders the battle panel and exits.
+        // Lets the drop-down's design be checked without a window or a network call.
+        if let path = ProcessInfo.processInfo.environment["CLAUDEMONSTER_BATTLE"] {
+            let pct = Int(ProcessInfo.processInfo.environment["CLAUDEMONSTER_MOCK_PERCENT"] ?? "") ?? 16
+            dumpBattle(to: path, usedPercent: pct); exit(0)
         }
         // Build hook: CLAUDEMONSTER_ICON=<path> renders the 1024px app icon and exits.
         // make-icon.sh calls this, so the icon always matches the live sprite.
@@ -1182,21 +1193,154 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Click routing
 
-    /// Clicking the sprite pets Claude; clicking anywhere else opens the menu.
+    /// Clicking the sprite pets Claude. A left-click elsewhere drops down the
+    /// battle screen; a right-click still opens the plain menu — that menu is
+    /// the only way to quit, so it must stay reachable even if the panel breaks.
     @objc func buttonClicked(_ sender: NSStatusBarButton) {
-        let inSprite = NSApp.currentEvent.map { ev -> Bool in
+        let event = NSApp.currentEvent
+        let inSprite = event.map { ev -> Bool in
             let p = sender.convert(ev.locationInWindow, from: nil)
             return p.x <= spriteHitMaxX
+        } ?? false
+        let isRightClick = event.map {
+            $0.type == .rightMouseUp || $0.modifierFlags.contains(.control)
         } ?? false
 
         // Petting needs a face to react with; while dozing or error, just menu.
         if inSprite && hasData && !sleeping {
             pet()
-        } else if let menu = currentMenu {
-            statusItem.menu = menu          // attach, pop up, then detach so the
-            sender.performClick(nil)        // next plain click reaches us again
-            statusItem.menu = nil
+        } else if isRightClick || !hasData || sleeping {
+            // No data means no HP to draw, so fall back to the menu, which also
+            // explains *why* (login needed / rate-limited).
+            popUpMenu(sender)
+        } else {
+            toggleBattlePanel(sender)
         }
+    }
+
+    private func popUpMenu(_ sender: NSStatusBarButton) {
+        guard let menu = currentMenu else { return }
+        statusItem.menu = menu          // attach, pop up, then detach so the
+        sender.performClick(nil)        // next plain click reaches us again
+        statusItem.menu = nil
+    }
+
+    // MARK: - Battle panel
+
+    func toggleBattlePanel(_ sender: NSStatusBarButton) {
+        if battlePanel != nil { closeBattlePanel() } else { openBattlePanel(sender) }
+    }
+
+    func openBattlePanel(_ button: NSStatusBarButton) {
+        let view = BattleView(frame: NSRect(x: 0, y: 0, width: BATTLE_W, height: BATTLE_H),
+                              usedPercent: driverUsed ?? 0, limits: lastLimits,
+                              selectedKind: selectedKind, compactOn: compact)
+        view.perform = { [weak self, weak view] action in
+            self?.runBattleAction(action, from: view)
+        }
+
+        let panel = BattlePanel(contentRect: view.frame,
+                                styleMask: [.borderless, .nonactivatingPanel],
+                                backing: .buffered, defer: false)
+        panel.isFloatingPanel = true
+        panel.level = .popUpMenu
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.contentView = view
+
+        // Sit under the status item, clamped into the screen on both axes — a
+        // short screen would otherwise cut the panel's bottom off.
+        var origin = NSPoint.zero
+        if let win = button.window {
+            let f = win.frame
+            var x = f.midX - BATTLE_W / 2
+            var y = f.minY - BATTLE_H - 4
+            if let vis = (win.screen ?? NSScreen.main)?.visibleFrame {
+                x = min(max(x, vis.minX + 8), vis.maxX - BATTLE_W - 8)
+                y = max(y, vis.minY + 8)
+                y = min(y, vis.maxY - BATTLE_H - 4)
+            }
+            origin = NSPoint(x: x, y: y)
+        }
+
+        panel.setFrameOrigin(NSPoint(x: origin.x, y: origin.y + 8))
+        panel.alphaValue = 0
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeFirstResponder(view)      // or arrow keys / Enter never reach it
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.13
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().setFrameOrigin(origin)
+            panel.animator().alphaValue = 1
+        }
+        battlePanel = panel
+
+        // NSPopover's .transient, by hand.
+        battleMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            self?.closeBattlePanel()
+        }
+        escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] ev in
+            guard ev.keyCode == 53 else { return ev }   // Esc
+            self?.closeBattlePanel()
+            return nil
+        }
+    }
+
+    /// Run a battle-menu action. Anything that changes tracked state goes through
+    /// the same methods the right-click menu uses, so the widget and the panel
+    /// can never disagree; afterwards the panel is refreshed from the new state.
+    func runBattleAction(_ action: BattleAction, from view: BattleView?) {
+        switch action {
+        case .pickLimit(let kind):
+            selectLimit(kind: kind)          // redraws the widget (Lv + HP)
+            refreshBattleView(view)
+        case .toggleCompact:
+            toggleCompact()                  // redraws the widget
+            refreshBattleView(view)
+        case .checkUpdate:
+            // The alert is modal; the panel would hang behind it, so dismiss first.
+            closeBattlePanel()
+            checkForUpdate(userInitiated: true)
+        case .refresh:
+            // Fetching is async, so the panel can only be refreshed once apply()
+            // has landed the new numbers — hence the delay rather than an
+            // immediate refreshBattleView(), which would redraw the old data.
+            refreshNow()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self, weak view] in
+                self?.refreshBattleView(view)
+            }
+        case .quit:
+            closeBattlePanel()
+            NSApp.terminate(nil)
+        case .openUsage, .openMore, .back, .none:
+            break                            // handled inside the view
+        }
+    }
+
+    /// Push the delegate's current state back into the open panel.
+    private func refreshBattleView(_ view: BattleView?) {
+        guard let view = view else { return }
+        view.usedPercent = driverUsed ?? 0
+        view.limits = lastLimits
+        view.selectedKind = selectedKind
+        view.compactOn = compact
+        view.needsDisplay = true
+    }
+
+    func closeBattlePanel() {
+        if let m = battleMonitor { NSEvent.removeMonitor(m); battleMonitor = nil }
+        if let m = escMonitor { NSEvent.removeMonitor(m); escMonitor = nil }
+        guard let panel = battlePanel else { return }
+        // Clear the reference first: the animation outlives this call, and a
+        // click landing mid-fade would otherwise toggle against a dying panel.
+        battlePanel = nil
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.09
+            panel.animator().alphaValue = 0
+        }, completionHandler: { panel.orderOut(nil) })
     }
 
     /// Show the happy face + an affection line for PETTING_HOLD seconds.
@@ -1212,13 +1356,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         renderNow()
     }
 
-    /// Menu action: switch which limit the widget tracks; remember the choice.
-    @objc func selectLimit(_ sender: NSMenuItem) {
-        guard let kind = sender.representedObject as? String else { return }
+    /// Switch which limit the widget tracks; remember the choice. Shared by the
+    /// right-click menu and the battle screen, so both stay in step — the widget
+    /// redraws either way.
+    func selectLimit(kind: String) {
         selectedKind = kind
         UserDefaults.standard.set(kind, forKey: "selectedKind")
         updateDriver(resetCycle: true)
         rebuildMenu()                             // rebuild to move the checkmark
+    }
+
+    /// Menu action: switch which limit the widget tracks.
+    @objc func selectLimitFromMenu(_ sender: NSMenuItem) {
+        guard let kind = sender.representedObject as? String else { return }
+        selectLimit(kind: kind)
     }
 
     /// Rebuild `currentMenu` from the latest result. Anything that changes what
@@ -1288,14 +1439,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Clickable row: selects this limit as the tracked one.
             let title = NSMenuItem(title: "\(label(for: l))   \(l.percent)% 사용",
-                                   action: #selector(selectLimit(_:)), keyEquivalent: "")
+                                   action: #selector(selectLimitFromMenu(_:)), keyEquivalent: "")
             title.target = self
             title.representedObject = l.kind
             title.state = (l.kind == selectedKind) ? .on : .off   // checkmark
             menu.addItem(title)
 
             // Bar + reset (informational)
-            let barItem = NSMenuItem(title: "", action: #selector(selectLimit(_:)), keyEquivalent: "")
+            let barItem = NSMenuItem(title: "", action: #selector(selectLimitFromMenu(_:)), keyEquivalent: "")
             barItem.target = self
             barItem.representedObject = l.kind
             let s = NSMutableAttributedString(string: "     \(bar)   리셋 \(resetIn(l.resetsAt))")
@@ -1404,6 +1555,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         try? png.write(to: URL(fileURLWithPath: path))
     }
 
+    /// Debug helper: render the battle panel offscreen so its design can be
+    /// inspected without opening a window or touching the network.
+    func dumpBattle(to path: String, usedPercent: Int) {
+        let now = Date()
+        let fixture = [
+            Limit(kind: "session", percent: usedPercent,
+                  resetsAt: now.addingTimeInterval(3600 * 2), scopeName: nil, isActive: true),
+            Limit(kind: "weekly_all", percent: 55,
+                  resetsAt: now.addingTimeInterval(86400 * 3), scopeName: nil, isActive: false),
+            Limit(kind: "weekly_scoped", percent: 0,
+                  resetsAt: nil, scopeName: "Fable", isActive: false),
+        ]
+        // All three menu pages, stacked, so a design change can be checked at once.
+        let pages: [BattleScreen] = [.root, .usage, .more]
+        let gap: CGFloat = 10
+        let size = NSSize(width: BATTLE_W, height: (BATTLE_H + gap) * CGFloat(pages.count) - gap)
+        let img = NSImage(size: size, flipped: false) { rect in
+            // cacheDisplay leaves everything outside the rounded panel transparent,
+            // which a PNG viewer paints white — that reads as a rendering bug when
+            // the live panel is simply see-through. Lay down a backdrop first.
+            NSColor(white: 0.25, alpha: 1).setFill(); rect.fill()
+            var y = size.height - BATTLE_H
+            for page in pages {
+                let view = BattleView(frame: NSRect(x: 0, y: 0, width: BATTLE_W, height: BATTLE_H),
+                                      usedPercent: usedPercent, limits: fixture,
+                                      selectedKind: "session", compactOn: true)
+                view.go(to: page)
+                if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                    view.cacheDisplay(in: view.bounds, to: rep)
+                    rep.draw(in: NSRect(x: 0, y: y, width: BATTLE_W, height: BATTLE_H))
+                }
+                y -= BATTLE_H + gap
+            }
+            return true
+        }
+        guard let tiff = img.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else { return }
+        try? png.write(to: URL(fileURLWithPath: path))
+    }
+
     /// Debug helper: stack sample widgets (varied HP + a mid-crossfade frame) into one PNG.
     func dumpSamples(to path: String) {
         driverResets = Date().addingTimeInterval(3600 + 47 * 60)
@@ -1441,6 +1633,605 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let rep = NSBitmapImageRep(data: total.tiffRepresentation!)!
         try? rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
     }
+}
+
+// MARK: - Battle screen (click-to-open panel)
+//
+// Clicking the widget drops down a Pokémon-style battle screen. It is a
+// borderless NSPanel, not an NSPopover: a popover forces an arrow and the
+// system's translucent material, neither of which can be removed, and both
+// clash with the pixel art. The cost is that "click outside to dismiss" —
+// free with popovers — has to be built by hand (see the global event monitor).
+//
+// Menu interaction is not wired up yet; the four items are inert. The right
+// -click NSMenu remains the way to quit, so a broken panel can never strand
+// the user with no way out.
+
+/// The battle screen's palette. GBC allowed three colors plus transparency per
+/// sprite; we keep that constraint (highlight / base / shadow + black outline).
+let GB_BG      = NSColor(white: 0.90, alpha: 1)   // same pill gray as the widget
+let GB_INK     = NSColor(srgbRed: 0.10, green: 0.10, blue: 0.11, alpha: 1)
+let GB_GREEN   = NSColor(srgbRed: 0x38/255, green: 0xD0/255, blue: 0x30/255, alpha: 1)
+let GB_ORANGE  = NSColor(srgbRed: 0xF8/255, green: 0xA8/255, blue: 0x28/255, alpha: 1)
+let GB_RED     = NSColor(srgbRed: 0xE8/255, green: 0x30/255, blue: 0x30/255, alpha: 1)
+let GB_EXP     = NSColor(srgbRed: 0x40/255, green: 0x90/255, blue: 0xE8/255, alpha: 1)
+let GB_YELLOW  = NSColor(srgbRed: 0xF8/255, green: 0xD0/255, blue: 0x28/255, alpha: 1)
+
+func gaugeColor(_ frac: CGFloat) -> NSColor {
+    if frac >= 0.5 { return GB_GREEN }
+    if frac >= 0.2 { return GB_ORANGE }
+    return GB_RED
+}
+
+let battleClawdColors: [Character: NSColor] = [
+    "K": GB_INK,
+    "L": NSColor(srgbRed: 0xE8/255, green: 0x9A/255, blue: 0x74/255, alpha: 1),
+    "B": NSColor(srgbRed: 0xD9/255, green: 0x77/255, blue: 0x57/255, alpha: 1),
+    "D": NSColor(srgbRed: 0xA6/255, green: 0x47/255, blue: 0x2E/255, alpha: 1),
+]
+
+/// Gastly's palette: a dark core wrapped in purple gas. 'B' is the gas (three
+/// tones, shaded), 'C' the near-black core, 'W'/'P' the eyes, 'T' the fangs.
+let bugColors: [Character: NSColor] = [
+    "K": GB_INK,
+    "L": NSColor(srgbRed: 0xB0/255, green: 0x80/255, blue: 0xD8/255, alpha: 1),  // gas highlight
+    "B": NSColor(srgbRed: 0x88/255, green: 0x58/255, blue: 0xB0/255, alpha: 1),  // gas
+    "D": NSColor(srgbRed: 0x58/255, green: 0x30/255, blue: 0x78/255, alpha: 1),  // gas shadow
+    "C": NSColor(srgbRed: 0x28/255, green: 0x20/255, blue: 0x38/255, alpha: 1),  // core
+    "W": NSColor.white,
+    "P": GB_INK,                                                                 // pupil
+    "T": NSColor.white,                                                          // fangs
+]
+
+/// The opponent: a "computer bug", drawn in the Gen-2 idiom — a big head with
+/// big eyes over a small body, everything wrapped in a black outline, and the
+/// silhouette readable at a glance. Cute, but with fangs and horns so it still
+/// reads as the thing eating your usage limit.
+///
+/// The opponent, styled after Gen-1 Gastly (고오스): a near-black core floating
+/// inside a ragged cloud of purple gas, with big white eyes and bared fangs.
+/// 22 wide x 20 tall.
+///
+/// The eyes, fangs and core are spelled out as their own characters rather than
+/// left as body cells: `battleShaded` only re-tones 'B', so anything that must
+/// keep its own color has to be written here or the gradient washes over it.
+let bugBase: [String] = [
+    "....K....KK....K......",   // gas wisps licking upward
+    "...KBK..KBBK..KBK.....",
+    "..KBBBKKBBBBKKBBBK.K..",
+    ".KBBBBBBBBBBBBBBBBBKBK",
+    "KBBBBKKKKKKKKKKKKBBBBK",   // gas opens to reveal the core
+    "KBBBKCCCCCCCCCCCCKBBBK",
+    "KBBKCCCCCCCCCCCCCCKBBK",
+    "KBKCCCWWCCCCCCWWCCCKBK",   // big eyes, corners knocked off so they read round
+    "KBKCCWWWWCCCCWWWWCCKBK",
+    "KBKCCWPPWCCCCWPPWCCKBK",
+    "KBKCCCWWCCCCCCWWCCCKBK",
+    "KBKCCCCCCCCCCCCCCCCKBK",
+    "KBKCTTTTTTTTTTTTTTCKBK",   // the grin: a solid band of white…
+    "KBBKCTCTCTCTCTCTCTKBBK",   // …that fangs bite down out of
+    "KBBBKCCCCCCCCCCCCKBBBK",
+    "KBBBBKKKKKKKKKKKKBBBBK",
+    ".KBBBBBBBBBBBBBBBBBBK.",
+    "K.KBBBKKBBBKKBBBKKBK.K",   // gas trailing off underneath
+    "..K.KBK..KBK..KBK.K...",
+    "....K.....K.....K.....",
+]
+
+/// Light comes from the top-left. Each body ('B') cell's tone follows a diagonal
+/// gradient (horizontal position within its row + vertical position overall),
+/// and only the cells where two tones meet get checkerboard-dithered.
+///
+/// Dithering whole columns instead produces vertical stripes that read as grime,
+/// not as retro shading — the boundary is the only place it belongs.
+func battleShaded(_ grid: [String], flatten: Bool = false) -> [String] {
+    let rows = grid.count
+    return grid.enumerated().map { (r, line) -> String in
+        var chars = Array(line)
+        let body = chars.indices.filter { chars[$0] == "B" }
+        guard let first = body.first, let last = body.last, last > first else { return line }
+        for i in body {
+            let u = Double(i - first) / Double(last - first)
+            let v = Double(r) / Double(max(rows - 1, 1))
+            // A flat body (the bug's shell) leans on horizontal position alone.
+            let t = flatten ? (0.75 * u + 0.25 * v) : (0.55 * u + 0.45 * v)
+            let dither = (r + i) % 2 == 0
+            switch t {
+            case ..<0.26: chars[i] = "L"
+            case ..<0.34: chars[i] = dither ? "L" : "B"
+            case ..<0.62: chars[i] = "B"
+            case ..<0.70: chars[i] = dither ? "D" : "B"
+            default:      chars[i] = "D"
+            }
+        }
+        return String(chars)
+    }
+}
+
+/// Claude from behind: the front-facing grid with the face left off, so the
+/// silhouette can never drift from the widget's. Nothing else is added — real
+/// Gen-2 back sprites carry no spine seam, and without a face this already
+/// reads as a back.
+func clawdBackGrid() -> [String] {
+    battleShaded(clawdBase)
+}
+
+func spriteSize(_ grid: [String], cell: CGFloat) -> NSSize {
+    NSSize(width: CGFloat(grid[0].count) * cell, height: CGFloat(grid.count) * cell)
+}
+
+let BATTLE_W: CGFloat = 480
+let BATTLE_H: CGFloat = 300
+
+let BATTLE_ENEMY_NAME  = "버그"
+let BATTLE_ENEMY_LEVEL = 50
+
+/// Which page of the 2x2 menu is showing. Choosing 사용량/기능 swaps only the
+/// dialogue box; the battle scene above it stays put.
+enum BattleScreen {
+    case root, usage, more
+
+    var message: String {
+        switch self {
+        case .root:  return "무엇을 할까?"
+        case .usage: return "어떤 한도를 볼까?"
+        case .more:  return "어떤 걸 해볼까?"
+        }
+    }
+}
+
+/// One cell of the 2x2 menu. `enabled == false` draws it dimmed and ignores clicks.
+struct BattleItem {
+    let title: String
+    let action: BattleAction
+    var enabled = true
+}
+
+enum BattleAction {
+    case openUsage, openMore, back
+    case pickLimit(String)      // limit `kind`
+    case toggleCompact
+    case checkUpdate
+    case refresh
+    case quit
+    case none                   // reserved slot, not yet decided
+}
+
+final class BattleView: NSView {
+    /// Used% of the tracked limit — the same number the menu-bar widget shows.
+    /// Re-read from the delegate after a limit switch, so the sprite's HP and Lv
+    /// follow the menu-bar widget.
+    var usedPercent: Int
+    /// The limits available on this account, in display order.
+    var limits: [Limit]
+    /// Which limit is tracked right now (a `kind`).
+    var selectedKind: String
+    /// Whether compact mode is on — drawn as a ✓ next to 간결 모드.
+    var compactOn: Bool
+
+    /// Actions are performed by the app delegate; the view only draws and routes.
+    var perform: (BattleAction) -> Void = { _ in }
+
+    var screen: BattleScreen = .root
+    var cursor = 0
+
+    // ── Animation
+    private var animTimer: Timer?
+    private var tick = 0
+    /// Claude's hop. The widget's version is 1px because it lives in a 22px menu
+    /// bar; here there is room for a taller, slower arc.
+    private var bob: CGFloat = 0
+    static let clawdHop: CGFloat = 4          // px at the top of the hop
+    /// The bug drifts toward a target, then picks a new one. Interpolating toward
+    /// a target (rather than jittering each frame) is what makes it read as
+    /// floating instead of vibrating.
+    private var bugOffset = NSPoint.zero
+    private var bugTarget = NSPoint.zero
+    static let bugDriftX: CGFloat = 16        // max px from center, horizontally
+    static let bugDriftY: CGFloat = 13        // less vertical room: indicators
+
+    init(frame: NSRect, usedPercent: Int, limits: [Limit], selectedKind: String, compactOn: Bool) {
+        self.usedPercent = usedPercent
+        self.limits = limits
+        self.selectedKind = selectedKind
+        self.compactOn = compactOn
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    /// Start/stop the animation with the view's presence on screen, so a closed
+    /// panel never keeps a timer (and a retain cycle) alive.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        animTimer?.invalidate()
+        animTimer = nil
+        guard window != nil else { return }
+        pickBugTarget()
+        animTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
+            self?.step()
+        }
+    }
+
+    /// Aim somewhere new, but never near where we already are: a target next to
+    /// the current position produces a twitch, not a drift.
+    private func pickBugTarget() {
+        let rx = Self.bugDriftX, ry = Self.bugDriftY
+        for _ in 0..<8 {
+            let p = NSPoint(x: .random(in: -rx...rx), y: .random(in: -ry...ry))
+            if hypot(p.x - bugOffset.x, p.y - bugOffset.y) > rx * 0.8 { bugTarget = p; return }
+        }
+        bugTarget = NSPoint(x: -bugOffset.x, y: -bugOffset.y)   // fall back: swing across
+    }
+
+    private func step() {
+        tick += 1
+
+        // Claude hops in a 4px arc. A sine gives the arc; rounding keeps it on
+        // the pixel grid, so the sprite never lands on a half-pixel and blurs.
+        let phase = Double(tick % 24) / 24.0
+        let newBob = (CGFloat(sin(phase * .pi * 2) * Double(Self.clawdHop))).rounded()
+
+        // Bug: ease toward the target, then choose another once close enough.
+        let dx = bugTarget.x - bugOffset.x, dy = bugTarget.y - bugOffset.y
+        bugOffset = NSPoint(x: bugOffset.x + dx * 0.085, y: bugOffset.y + dy * 0.085)
+        if abs(dx) + abs(dy) < 1.5 { pickBugTarget() }
+
+        // draw(_:) repaints the whole panel (the rounded background makes a
+        // partial repaint fiddly), so only ask for one when something moved.
+        let moved = newBob != bob || abs(dx) + abs(dy) > 0.05
+        bob = newBob
+        if moved { needsDisplay = true }
+    }
+
+    deinit { animTimer?.invalidate() }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    static let bigFontSize: CGFloat = 17
+    static let hpLabelSize: CGFloat = 11
+    static let cellH: CGFloat = 32
+    let dialogH: CGFloat = cellH * 2 + 8 + 24
+    let pad: CGFloat = 12
+    let boxBorder: CGFloat = 4
+    /// Horizontal breathing room inside each menu cell. Without it the right
+    /// column's text sits flush against the container's border.
+    ///
+    /// These numbers are load-bearing together, alongside BATTLE_W: the longest
+    /// label ("사용량 선택" / "간결 모드 ✓", ~90pt at 16pt) must fit in
+    ///   cellWidth - (cellPadX + cursorW) - cellPadX
+    /// while the longest message ("어떤 한도를 볼까?", ~136pt) still fits the
+    /// left area. Both clear by only a few points — widen the cursor gap or the
+    /// padding without also widening the panel and text starts clipping.
+    let cellPadX: CGFloat = 12
+    let cursorW: CGFloat = 18       // cursor column: ▶ plus the gap before the label
+    let menuRatio: CGFloat = 0.60
+    static let itemFontSize: CGFloat = 16
+
+    /// The four cells of the current page. 사용량 is built from the account's
+    /// real limits, so an account without a scoped (Fable) limit never shows one.
+    var items: [BattleItem] {
+        switch screen {
+        case .root:
+            return [
+                BattleItem(title: "사용량 선택", action: .openUsage),
+                BattleItem(title: "색상 커스텀", action: .none, enabled: false),
+                BattleItem(title: "기능 더보기", action: .openMore),
+                BattleItem(title: "종료하기", action: .quit),
+            ]
+        case .usage:
+            let order = ["session", "weekly_all", "weekly_scoped"]
+            let sorted = limits.sorted {
+                (order.firstIndex(of: $0.kind) ?? 9) < (order.firstIndex(of: $1.kind) ?? 9)
+            }
+            var out = sorted.prefix(3).map {
+                BattleItem(title: shortLabel(for: $0), action: .pickLimit($0.kind))
+            }
+            while out.count < 3 { out.append(BattleItem(title: "—", action: .none, enabled: false)) }
+            out.append(BattleItem(title: "뒤로", action: .back))
+            return out
+        case .more:
+            return [
+                BattleItem(title: compactOn ? "간결 모드 ✓" : "간결 모드", action: .toggleCompact),
+                BattleItem(title: "버전 확인", action: .checkUpdate),
+                BattleItem(title: "새로고침", action: .refresh),
+                BattleItem(title: "뒤로", action: .back),
+            ]
+        }
+    }
+
+    /// The full menu labels ("세션 (5시간)") do not fit a cell, so shorten them.
+    private func shortLabel(for l: Limit) -> String {
+        switch l.kind {
+        case "session":       return "5시간"
+        case "weekly_all":    return "주간"
+        case "weekly_scoped": return l.scopeName ?? "주간 범위"
+        default:              return l.kind
+        }
+    }
+
+    // The player's indicator carries four rows (name / gauge / numbers / exp),
+    // so it must be taller than the enemy's or the numbers collide with the gauge.
+    let enemyBoxSize = NSSize(width: 195, height: 44)
+    // 64 is about the floor: below ~62 the HP numbers start overlapping the exp
+    // bar, since name/gauge hang from the top and numbers/exp stack from the base.
+    let playerBoxSize = NSSize(width: 200, height: 64)
+
+    override func draw(_ dirty: NSRect) {
+        let r = bounds
+        GB_BG.setFill()
+        let outer = NSBezierPath(roundedRect: r.insetBy(dx: 1, dy: 1), xRadius: 8, yRadius: 8)
+        outer.fill()
+        GB_INK.setStroke(); outer.lineWidth = 2; outer.stroke()
+
+        // Battle area first, dialog box over it: that is what crops Claude's legs.
+        drawBattleArea(NSRect(x: r.minX, y: r.minY + dialogH,
+                              width: r.width, height: r.height - dialogH))
+        drawDialogBox(dialogBox)
+    }
+
+    private func drawBattleArea(_ area: NSRect) {
+        let enemyBox = NSRect(x: area.minX + 14, y: area.maxY - enemyBoxSize.height - 12,
+                              width: enemyBoxSize.width, height: enemyBoxSize.height)
+        let playerBox = NSRect(x: area.maxX - playerBoxSize.width - 14, y: area.minY + 6,
+                               width: playerBoxSize.width, height: playerBoxSize.height)
+
+        // Sprites are centered in whatever space the indicators leave, so changing
+        // an indicator's size moves the sprite with it instead of stranding it.
+        // The bug floats around that center; Claude hops in place.
+        let eGrid = battleShaded(bugBase, flatten: true)
+        let eCell: CGFloat = 4.0
+        let eSize = spriteSize(eGrid, cell: eCell)
+        let eField = NSRect(x: enemyBox.maxX, y: playerBox.maxY,
+                            width: area.maxX - enemyBox.maxX, height: area.maxY - playerBox.maxY)
+        drawSprite(eGrid, origin: NSPoint(x: eField.midX - eSize.width / 2 - 9 + bugOffset.x,
+                                          y: eField.midY - eSize.height / 2 - 10 + bugOffset.y),
+                   cell: eCell, colors: bugColors)
+
+        let pGrid = clawdBackGrid()
+        let pCell: CGFloat = 5.8
+        let pSize = spriteSize(pGrid, cell: pCell)
+        let pField = NSRect(x: area.minX, y: area.minY,
+                            width: playerBox.minX - area.minX, height: enemyBox.minY - area.minY)
+        drawSprite(pGrid, origin: NSPoint(x: pField.midX - pSize.width / 2,
+                                          y: pField.midY - pSize.height / 2 - 45 + bob),
+                   cell: pCell, colors: battleClawdColors)
+
+        drawIndicator(enemyBox, name: BATTLE_ENEMY_NAME, level: BATTLE_ENEMY_LEVEL,
+                      frac: 1, isPlayer: false)
+        let remaining = max(0, min(100, 100 - usedPercent))
+        drawIndicator(playerBox, name: "클로드", level: usedPercent,
+                      frac: CGFloat(remaining) / 100, isPlayer: true, remaining: remaining)
+    }
+
+    /// Gen-2 indicator: name (larger) + level (smaller) on one baseline, a thin
+    /// rectangular gauge, and a frame made of a thick vertical band plus a thin
+    /// bottom rule (~5x thinner) ending in a half-arrowhead. The player's is
+    /// mirrored, and carries big HP numbers plus a container-less exp bar that
+    /// fills right-to-left.
+    private func drawIndicator(_ box: NSRect, name: String, level: Int, frac: CGFloat,
+                               isPlayer: Bool, remaining: Int = 0) {
+        let title = NSMutableAttributedString(string: name,
+            attributes: [.font: pixelFont(18), .foregroundColor: GB_INK])
+        title.append(NSAttributedString(string: ":L\(level)",
+            attributes: [.font: pixelFont(14), .foregroundColor: GB_INK]))
+        let ts = title.size()
+
+        let bandW: CGFloat = 7.5
+        let lineH: CGFloat = 1.5
+        let arrowW: CGFloat = 10
+        let arrowH: CGFloat = 7
+        let lineY = box.minY
+
+        let unitH: CGFloat = 12
+        let unitY = box.maxY - ts.height - unitH - 2
+        let labelW: CGFloat = 28
+        let unit = isPlayer
+            ? NSRect(x: box.minX + 8, y: unitY, width: box.width - 8 - bandW + 1, height: unitH)
+            : NSRect(x: box.minX + bandW - 1, y: unitY, width: box.width - bandW - 3, height: unitH)
+
+        // The name ends where the HP unit's black box ends, on both sides. Anchor
+        // to the unit, not the box: the two frames are mirrored and inset
+        // differently, so the gauge is the only landmark they share.
+        // (Starting the name *at* unit.maxX would push Claude's off the panel.)
+        title.draw(at: NSPoint(x: unit.maxX - ts.width, y: box.maxY - ts.height))
+
+        NSGraphicsContext.current?.saveGraphicsState()
+        NSGraphicsContext.current?.shouldAntialias = false
+        GB_INK.setFill(); unit.fill()
+        // The enemy's track stops short, leaving the thick black cap on its right.
+        let trackR: CGFloat = isPlayer ? 1.5 : 4
+        let track = NSRect(x: unit.minX + labelW, y: unit.minY + 1.5,
+                           width: unit.width - labelW - trackR, height: unitH - 3)
+        NSColor.white.setFill(); track.fill()
+        if frac > 0 {
+            gaugeColor(frac).setFill()
+            NSRect(x: track.minX, y: track.minY,
+                   width: track.width * frac, height: track.height).fill()
+        }
+        NSGraphicsContext.current?.restoreGraphicsState()
+
+        let hpAttr: [NSAttributedString.Key: Any] = [.font: pixelFont(Self.hpLabelSize),
+                                                     .foregroundColor: GB_YELLOW]
+        let hpLabel = "HP:" as NSString
+        let hs = hpLabel.size(withAttributes: hpAttr)
+        hpLabel.draw(at: NSPoint(x: unit.minX + 5, y: unit.minY + (unitH - hs.height) / 2),
+                     withAttributes: hpAttr)
+
+        if isPlayer {
+            let numAttr: [NSAttributedString.Key: Any] = [.font: pixelFont(20), .foregroundColor: GB_INK]
+            let num = "\(remaining)/ 100" as NSString
+            let ns = num.size(withAttributes: numAttr)
+            num.draw(at: NSPoint(x: box.maxX - bandW - 6 - ns.width, y: unit.minY - ns.height - 1),
+                     withAttributes: numAttr)
+        }
+
+        NSGraphicsContext.current?.saveGraphicsState()
+        NSGraphicsContext.current?.shouldAntialias = false
+        GB_INK.setFill()
+        if isPlayer {
+            NSRect(x: box.maxX - bandW, y: lineY, width: bandW, height: unit.maxY - lineY).fill()
+            let tipX = box.minX - 6
+            NSRect(x: tipX + arrowW, y: lineY, width: box.maxX - (tipX + arrowW), height: lineH).fill()
+            let arrow = NSBezierPath()
+            arrow.move(to: NSPoint(x: tipX + arrowW, y: lineY))
+            arrow.line(to: NSPoint(x: tipX + arrowW, y: lineY + arrowH))
+            arrow.line(to: NSPoint(x: tipX, y: lineY))
+            arrow.close(); arrow.fill()
+            let expX = tipX + arrowW + 2
+            let exp = NSRect(x: expX, y: lineY + lineH + 2,
+                             width: (box.maxX - bandW) - expX - 1, height: 4)
+            GB_EXP.setFill()
+            NSRect(x: exp.maxX - exp.width * 0.55, y: exp.minY,
+                   width: exp.width * 0.55, height: exp.height).fill()
+        } else {
+            NSRect(x: box.minX, y: lineY, width: bandW, height: unit.maxY - lineY).fill()
+            let endX = box.maxX + 6
+            NSRect(x: box.minX, y: lineY, width: (endX - arrowW) - box.minX, height: lineH).fill()
+            let arrow = NSBezierPath()
+            arrow.move(to: NSPoint(x: endX - arrowW, y: lineY))
+            arrow.line(to: NSPoint(x: endX - arrowW, y: lineY + arrowH))
+            arrow.line(to: NSPoint(x: endX, y: lineY))
+            arrow.close(); arrow.fill()
+        }
+        // Restore, or the dialog box's curves drawn next come out jagged too.
+        NSGraphicsContext.current?.restoreGraphicsState()
+    }
+
+    var dialogBox: NSRect {
+        NSRect(x: bounds.minX + pad, y: bounds.minY + pad,
+               width: bounds.width - pad * 2, height: dialogH - pad * 2)
+    }
+    var menuBox: NSRect {
+        let w = dialogBox.width * menuRatio
+        return NSRect(x: dialogBox.maxX - w, y: dialogBox.minY, width: w, height: dialogBox.height)
+    }
+    var menuInner: NSRect { menuBox.insetBy(dx: boxBorder, dy: boxBorder) }
+
+    /// The four cells divide menuInner exactly, with no gaps between them.
+    /// (Text is inset within each cell; see cellPadX.)
+    func itemRect(_ i: Int) -> NSRect {
+        let col = CGFloat(i % 2), row = CGFloat(i / 2)
+        let w = menuInner.width / 2, h = menuInner.height / 2
+        return NSRect(x: menuInner.minX + col * w, y: menuInner.maxY - (row + 1) * h,
+                      width: w, height: h)
+    }
+
+    private func drawDialogBox(_ box: NSRect) {
+        GB_BG.setFill()
+        let path = NSBezierPath(roundedRect: box, xRadius: 6, yRadius: 6)
+        path.fill()
+        GB_INK.setStroke(); path.lineWidth = 3; path.stroke()
+        let inner = NSBezierPath(roundedRect: box.insetBy(dx: 4, dy: 4), xRadius: 4, yRadius: 4)
+        GB_INK.setStroke(); inner.lineWidth = 1; inner.stroke()
+
+        GB_BG.setFill()
+        let mPath = NSBezierPath(roundedRect: menuBox, xRadius: 6, yRadius: 6)
+        mPath.fill()
+        GB_INK.setStroke(); mPath.lineWidth = 3; mPath.stroke()
+        let mInner = NSBezierPath(roundedRect: menuBox.insetBy(dx: 4, dy: 4), xRadius: 4, yRadius: 4)
+        GB_INK.setStroke(); mInner.lineWidth = 1; mInner.stroke()
+
+        let font = pixelFont(Self.itemFontSize)
+        let attr: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: GB_INK]
+        // The message sits on the same baseline as the menu's top row, not the
+        // box's vertical center, so the two columns read as one line of text.
+        let msg = screen.message as NSString
+        let mh = msg.size(withAttributes: attr).height
+        msg.draw(at: NSPoint(x: box.minX + 16, y: itemRect(0).midY - mh / 2), withAttributes: attr)
+
+        let dim: [NSAttributedString.Key: Any] = [.font: font,
+                                                  .foregroundColor: GB_INK.withAlphaComponent(0.30)]
+        for (i, item) in items.enumerated() {
+            let cell = itemRect(i)
+            let a = item.enabled ? attr : dim
+            let title = item.title as NSString
+            let ih = title.size(withAttributes: a).height
+            let ty = cell.midY - ih / 2
+            // The cursor lives in the left padding, so the text always starts at
+            // the same x whether or not this cell is selected.
+            title.draw(at: NSPoint(x: cell.minX + cellPadX + cursorW, y: ty), withAttributes: a)
+            if i == cursor && item.enabled {
+                ("▶" as NSString).draw(at: NSPoint(x: cell.minX + cellPadX - 2, y: ty),
+                                       withAttributes: attr)
+            }
+        }
+    }
+
+    // MARK: - Interaction
+
+    /// Move the cursor onto the first selectable cell at or after `from`.
+    private func firstEnabled(from: Int) -> Int {
+        let all = items
+        if all.indices.contains(from), all[from].enabled { return from }
+        return all.firstIndex(where: { $0.enabled }) ?? 0
+    }
+
+    func go(to screen: BattleScreen) {
+        self.screen = screen
+        // Entering 사용량 starts the cursor on the limit already being tracked.
+        if screen == .usage,
+           let i = items.firstIndex(where: {
+               if case .pickLimit(let k) = $0.action { return k == selectedKind }
+               return false
+           }) {
+            cursor = i
+        } else {
+            cursor = firstEnabled(from: 0)
+        }
+        needsDisplay = true
+    }
+
+    override func keyDown(with e: NSEvent) {
+        var next = cursor
+        switch e.keyCode {
+        case 126: if cursor >= 2 { next = cursor - 2 }        // ↑
+        case 125: if cursor < 2  { next = cursor + 2 }        // ↓
+        case 123: if cursor % 2 == 1 { next = cursor - 1 }    // ←
+        case 124: if cursor % 2 == 0 { next = cursor + 1 }    // →
+        case 36, 76: activate(); return                        // Enter
+        default: super.keyDown(with: e); return
+        }
+        if items.indices.contains(next), items[next].enabled { cursor = next }
+        needsDisplay = true
+    }
+
+    override func mouseMoved(with e: NSEvent) { hover(e) }
+    override func mouseDown(with e: NSEvent) { hover(e); activate() }
+
+    private func hover(_ e: NSEvent) {
+        let p = convert(e.locationInWindow, from: nil)
+        let all = items
+        for i in all.indices where itemRect(i).contains(p) && all[i].enabled {
+            if cursor != i { cursor = i; needsDisplay = true }
+        }
+    }
+
+    private func activate() {
+        let all = items
+        guard all.indices.contains(cursor), all[cursor].enabled else { return }
+        switch all[cursor].action {
+        case .openUsage: go(to: .usage)
+        case .openMore:  go(to: .more)
+        case .back:      go(to: .root)
+        case .none:      break
+        default:         perform(all[cursor].action)
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds,
+                                       options: [.mouseMoved, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+}
+
+/// Borderless panels do not become key by default, which would leave the panel
+/// unable to take the Escape key.
+final class BattlePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
 }
 
 // MARK: - Entry point
