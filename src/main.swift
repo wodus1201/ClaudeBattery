@@ -112,6 +112,21 @@ func pettingLines(mood: Mood) -> [String] {
     }
 }
 
+/// Petting reactions shown only while wearing a rare skin — the shiny reacts as
+/// itself, not as a recolored Claude. Kept separate from pettingLines(mood:) so
+/// they read as belonging to the skin rather than to the HP state.
+///
+/// Anything added here MUST also reach allSlotStrings(), or the first time one of
+/// these appears the widget's slot resizes and the whole thing lurches.
+func shinyPettingLines() -> [String] {
+    [
+        "이로치 클로드가 반짝반짝 빛난다!",
+        "이로치 클로드가 자랑스럽게 뽐낸다!",
+        "이로치 클로드가 눈부시게 웃는다!",
+        "반짝이는 비늘이 손끝을 스친다!",
+    ]
+}
+
 /// How long a petting reaction stays on screen before the normal slot cycle resumes.
 let PETTING_HOLD: TimeInterval = 3.0
 
@@ -142,6 +157,7 @@ func allSlotStrings() -> [String] {
     var s = [90, 70, 45, 25, 10, 5, 0].map { flavorLine(remaining: $0) }
     // Sprite-click reactions share the same slot, so reserve room for them too.
     s += [Mood.healthy, .tired, .hurt, .fainted].flatMap { pettingLines(mood: $0) }
+    s += shinyPettingLines()   // shown only on the shiny, but the slot must fit them
     s.append(SLEEP_MESSAGE)
     s.append(ARRIVED_MESSAGE)
     // Longest plausible countdown renderings.
@@ -195,6 +211,15 @@ struct ClawdSkin {
     let base: NSColor        // body 'B'
     let shadow: NSColor      // outline/shadow 'D'
     var unlockPets: Int = 0
+    /// Overrides the derived outline. Only the shiny sets this — a gold keyline is
+    /// how it stays distinguishable when nothing is moving, since the sparkle
+    /// (below) is transient and the ★ is easy to overlook.
+    var outlineOverride: NSColor? = nil
+
+    /// The shiny is the only skin with an unlock gate, and everything that marks
+    /// it as rare keys off this rather than off a literal "shiny" id, so a second
+    /// gated skin would inherit the whole treatment for free.
+    var isRare: Bool { unlockPets > 0 }
 
     /// Widget sprite is 2-tone (B/D) over fixed face details (K/W/T/M).
     var widgetColors: [Character: NSColor] {
@@ -209,6 +234,7 @@ struct ClawdSkin {
     /// Derived, not hand-picked, so every skin — and any skin added later — gets
     /// an outline that matches its body instead of one more color to keep in sync.
     var outline: NSColor {
+        if let o = outlineOverride { return o }
         let c = shadow.usingColorSpace(.sRGB) ?? shadow
         return NSColor(srgbRed: c.redComponent * 0.55,
                        green: c.greenComponent * 0.55,
@@ -231,7 +257,8 @@ let ALL_SKINS: [ClawdSkin] = [
               highlight: rgb(0xF5,0xB8,0x95), base: rgb(0xD9,0x77,0x57), shadow: rgb(0xA6,0x47,0x2E)),
     ClawdSkin(id: "shiny", name: "이로치",
               highlight: rgb(0xFC,0xF0,0xC0), base: rgb(0xF0,0xC2,0x52), shadow: rgb(0xBE,0x86,0x2E),
-              unlockPets: PETS_TO_SHINY),
+              unlockPets: PETS_TO_SHINY,
+              outlineOverride: rgb(0x6B,0x45,0x0E)),   // warm gold-brown, not the derived near-black
     ClawdSkin(id: "opus", name: "오퍼스",
               highlight: rgb(0xCF,0xAC,0xF0), base: rgb(0x88,0x58,0xB0), shadow: rgb(0x57,0x30,0x80)),
     ClawdSkin(id: "sonnet", name: "소네트",
@@ -315,6 +342,99 @@ func drawSprite(_ grid: [String], origin: NSPoint, cell: CGFloat, colors: [Chara
     }
     ctx.restoreGraphicsState()
 }
+
+// MARK: - Shiny sparkle
+
+/// The four-pointed star of the Pokémon shiny effect, as a pixel grid so it sits
+/// on the same grid as the sprites instead of looking like a vector overlay.
+/// 'E' is a darker gold rim: on the panel's light gray a pure-gold star washes
+/// out, so the points are edged to hold their shape.
+let SPARKLE_GRID: [String] = [
+    "...E...",
+    "...S...",
+    "..ESE..",
+    ".ESWSE.",
+    "ESSWSSE",
+    ".ESWSE.",
+    "..ESE..",
+    "...S...",
+    "...E...",
+]
+
+/// The menu-bar star. A 22px bar leaves the sprite ~18pt tall, and scaling the
+/// 9-row grid into that gives sub-point cells — which vanish outright, since
+/// drawSprite() fills with antialiasing off. So small frames get their own
+/// coarse grid instead of a shrunken fine one.
+let SPARKLE_GRID_SMALL: [String] = [
+    ".S.",
+    "SWS",
+    ".S.",
+]
+
+/// Below this frame height the fine grid can't hold a whole point per cell.
+let SPARKLE_SMALL_BELOW: CGFloat = 40
+
+/// Where the stars pop, as offsets from the sprite's center in *sprite cells*, so
+/// one layout works at any cell size. Each carries its own scale and the fraction
+/// of the burst it appears at, so they fire in sequence rather than all at once —
+/// a simultaneous pop reads as a flash, a staggered one reads as a sparkle.
+let SPARKLE_BURST: [(dx: CGFloat, dy: CGFloat, scale: CGFloat, at: Double)] = [
+    (-0.42,  0.34, 1.00, 0.00),
+    ( 0.40,  0.18, 0.75, 0.14),
+    (-0.22, -0.30, 0.70, 0.30),
+    ( 0.30, -0.36, 0.55, 0.46),
+]
+
+/// How long the entrance burst lasts.
+let SPARKLE_DURATION: TimeInterval = 1.1
+
+/// Draw the burst over `frame` at `t` in 0...1. Each star fades in fast and out
+/// slow within its own window, so the group twinkles instead of blinking as one.
+///
+/// Star size is a fraction of `frame`, never an absolute: the same call has to
+/// work over a 122pt battle sprite and an 18pt one in a 22px menu bar, and a
+/// fixed cell size that suits either one is grotesque in the other.
+func drawSparkles(in frame: NSRect, t: Double, gold: NSColor) {
+    guard t >= 0, t <= 1 else { return }
+    let colors: [Character: NSColor] = ["S": gold, "W": .white, "E": SHINY_GOLD_EDGE]
+    let small = frame.height < SPARKLE_SMALL_BELOW
+    let grid = small ? SPARKLE_GRID_SMALL : SPARKLE_GRID
+    let rows = CGFloat(grid.count)
+    // The biggest star spans ~40% of the sprite's height.
+    let unit = frame.height * 0.40 / rows
+    for s in SPARKLE_BURST {
+        let local = (t - s.at) / 0.5          // each star owns half the burst
+        guard local >= 0, local <= 1 else { continue }
+        // Fade: quick rise, slow fall. sin gives that shape over 0...1 for free.
+        let alpha = sin(local * .pi)
+        guard alpha > 0.02 else { continue }
+
+        // Never let a cell fall below a point: drawSprite() fills with antialiasing
+        // off, so a sub-point rect rounds away to nothing and the star disappears.
+        let cell = max(unit * s.scale, 1)
+        let w = CGFloat(grid[0].count) * cell
+        let h = CGFloat(grid.count) * cell
+        let origin = NSPoint(x: frame.midX + s.dx * frame.width - w / 2,
+                             y: frame.midY + s.dy * frame.height - h / 2)
+
+        NSGraphicsContext.current?.saveGraphicsState()
+        // The whole star fades as one; per-cell alpha would dither at these sizes.
+        let faded = colors.mapValues { $0.withAlphaComponent(CGFloat(alpha)) }
+        drawSprite(grid, origin: origin, cell: cell, colors: faded)
+        NSGraphicsContext.current?.restoreGraphicsState()
+    }
+}
+
+/// The shiny's star color, and the ★ used to mark it in menus.
+let SHINY_GOLD = NSColor(srgbRed: 0xFF/255, green: 0xDE/255, blue: 0x6A/255, alpha: 1)
+let SHINY_GOLD_EDGE = NSColor(srgbRed: 0xC8/255, green: 0x8A/255, blue: 0x18/255, alpha: 1)
+let SHINY_MARK = "★"
+
+/// The menu-bar twinkle, in animation ticks (the widget timer runs at 12fps).
+/// The widget redraws only when its signature changes, so the sparkle is stepped
+/// as an integer frame index: it burns ~24 frames every 30s and is idle between.
+let WIDGET_SPARKLE_PERIOD = 360      // 30s at 12fps
+let WIDGET_SPARKLE_FRAMES = 24       // 2s of twinkle
 
 // MARK: - Model
 
@@ -1063,6 +1183,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let phase = animTick % 24
         var blink = isFainted ? false : (phase == 0 || phase == 1)
 
+        // The shiny twinkles in the menu bar every WIDGET_SPARKLE_PERIOD ticks, so
+        // its rarity shows even when no panel is open. A fainted Claude does not
+        // sparkle — the joke lands badly at 0 HP.
+        // Quantized to a frame index (not a continuous alpha) because it has to go
+        // into lastSignature, and a float there would defeat the cheap-skip.
+        var sparkleFrame = -1
+        if currentSkin.isRare && !isFainted && !sleeping {
+            let p = animTick % WIDGET_SPARKLE_PERIOD
+            if p < WIDGET_SPARKLE_FRAMES { sparkleFrame = p }
+        }
+
         let primary: String, secondary: String?, alpha: CGFloat
         if sleeping {
             // Dozing: closed eyes, no swap — just the sleep line.
@@ -1077,14 +1208,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             (primary, secondary, alpha) = slotTexts(elapsed: elapsed, remaining: remaining)
         }
 
-        let sig = "\(used)|\(hpUnknown)|\(bob)|\(blink)|sleep=\(sleeping)|pet=\(petting)|\(compact)|\(primary)|\(secondary ?? "")|\(Int(alpha * 12))"
+        // skin and sparkleFrame are part of what's on screen, so they belong in the
+        // signature — leave either out and the widget keeps the stale image.
+        let sig = "\(used)|\(hpUnknown)|\(bob)|\(blink)|sleep=\(sleeping)|pet=\(petting)|\(compact)|\(primary)|\(secondary ?? "")|\(Int(alpha * 12))|\(selectedSkinID)|spk=\(sparkleFrame)"
         if sig == lastSignature { return }
         lastSignature = sig
 
         let img = buildImage(used: used, remaining: remaining, bob: CGFloat(bob),
                              blink: blink, primary: primary, secondary: secondary, alpha: alpha,
                              sleeping: sleeping, hpUnknown: hpUnknown, compact: compact,
-                             petting: petting)
+                             petting: petting, sparkleFrame: sparkleFrame)
         statusItem.button?.attributedTitle = NSAttributedString(string: "")
         statusItem.button?.image = img
         statusItem.button?.imagePosition = .imageOnly
@@ -1093,7 +1226,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func buildImage(used: Int, remaining: Int, bob: CGFloat, blink: Bool,
                     primary: String, secondary: String?, alpha: CGFloat,
                     sleeping: Bool = false, hpUnknown: Bool = false, compact: Bool = false,
-                    petting: Bool = false) -> NSImage {
+                    petting: Bool = false, sparkleFrame: Int = -1) -> NSImage {
         // When HP is unknown (dozing before any data), the gauge is empty gray.
         let frac: CGFloat = hpUnknown ? 1 : CGFloat(remaining) / 100.0
         // Gauge turns gray while dozing.
@@ -1169,6 +1302,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Fainted stays grayscale regardless of skin; otherwise use the skin.
             let colors: [Character: NSColor] = remaining == 0 ? spriteColorsFainted : self.currentSkin.widgetColors
             drawSprite(grid, origin: spriteOrigin, cell: cell, colors: colors)
+
+            // The shiny's periodic twinkle. Drawn inside the sprite's own box so it
+            // cannot widen the widget — the menu bar gives us 22px and no more.
+            if sparkleFrame >= 0 {
+                let t = Double(sparkleFrame) / Double(WIDGET_SPARKLE_FRAMES)
+                drawSparkles(in: NSRect(x: spriteOrigin.x, y: spriteOrigin.y,
+                                        width: spriteW, height: spriteH),
+                             t: t, gold: SHINY_GOLD)
+            }
             x += spriteW + spriteNameGap   // 스프라이트 ↔ 이름 간격
 
             func drawText(_ s: String, _ attrs: [NSAttributedString.Key: Any], _ sz: NSSize) {
@@ -1434,12 +1576,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Push the delegate's current state back into the open panel.
     private func refreshBattleView(_ view: BattleView?) {
         guard let view = view else { return }
+        let wasShiny = view.isShiny
         view.usedPercent = driverUsed ?? 0
         view.limits = lastLimits
         view.selectedKind = selectedKind
         view.compactOn = compact
         view.skinID = selectedSkinID
         view.petCount = petCount
+        // Switching *into* the shiny replays the burst — that pick is the payoff
+        // for 50 pets. Only on the transition, or every refresh would re-fire it.
+        if !wasShiny && view.isShiny { view.startSparkle() }
         view.needsDisplay = true
     }
 
@@ -1459,7 +1605,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// counts toward unlocking the shiny skin; the count persists.
     func pet() {
         let remaining = max(0, min(100, 100 - (driverUsed ?? 0)))
-        var pool = pettingLines(mood: mood(remaining: remaining))
+        let m = mood(remaining: remaining)
+        // The shiny gets its own reactions — but a fainted Claude stays fainted,
+        // so the somber lines still win. Rarity does not outrank 0 HP.
+        var pool = (currentSkin.isRare && m != .fainted)
+            ? shinyPettingLines()
+            : pettingLines(mood: m)
         if pool.count > 1 { pool.removeAll { $0 == lastPettingLine } }
         let line = pool.randomElement() ?? lastPettingLine
         lastPettingLine = line
@@ -1712,10 +1863,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSColor(white: 0.25, alpha: 1).setFill(); rect.fill()
             var y = size.height - BATTLE_H
             for page in pages {
+                // CLAUDEMONSTER_SKIN=<id> dumps the panel wearing that skin, so the
+                // shiny's gold outline and ★ can be checked without 50 real pets.
+                let dumpSkin = ProcessInfo.processInfo.environment["CLAUDEMONSTER_SKIN"] ?? "default"
                 let view = BattleView(frame: NSRect(x: 0, y: 0, width: BATTLE_W, height: BATTLE_H),
                                       usedPercent: usedPercent, limits: fixture,
                                       selectedKind: "session", compactOn: true,
-                                      skinID: "default", petCount: PETS_TO_SHINY)
+                                      skinID: dumpSkin, petCount: PETS_TO_SHINY)
                 view.go(to: page)
                 if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
                     view.cacheDisplay(in: view.bounds, to: rep)
@@ -1843,6 +1997,10 @@ let bugColors: [Character: NSColor] = [
 /// Unlocked by clicking the enemy's black HP plate seven times: the Korean
 /// ladybug is 칠성무당벌레 — the seven-spotted one.
 let LADYBUG_CLICKS = 7
+
+/// How long the egg's barker holds the dialogue slot before the menu's own
+/// message comes back.
+let LADYBUG_FLASH_HOLD: TimeInterval = 2.6
 
 let ladybugColors: [Character: NSColor] = [
     ".": .clear,
@@ -2070,6 +2228,32 @@ final class BattleView: NSView {
     private var ladybug = false
     var bugPalette: [Character: NSColor] { ladybug ? ladybugColors : bugColors }
 
+    /// A transient two-line barker that takes over the dialogue slot when the egg
+    /// fires, then expires back to the screen's own message. Two lines because the
+    /// beat is a pause and then the reveal — one line would give it all away at once.
+    private var flashLines: [String] = []
+    private var flashUntil: Date?
+    private var flashing: Bool {
+        guard let u = flashUntil else { return false }
+        return Date() < u
+    }
+
+    // ── Shiny sparkle
+    /// When the entrance burst started, or nil once it has run. Set on appear and
+    /// on switching *to* the shiny, so picking it in the menu replays the effect —
+    /// that moment is the payoff for 50 pets and should not pass unmarked.
+    private var sparkleStart: Date?
+    /// The player's sprite frame, recorded while drawing so the burst can be placed
+    /// over it without recomputing the battle-area layout.
+    private var playerSpriteRect = NSRect.zero
+    var isShiny: Bool { skin(id: skinID).isRare }
+
+    func startSparkle() {
+        guard isShiny else { return }
+        sparkleStart = Date()
+        needsDisplay = true
+    }
+
     init(frame: NSRect, usedPercent: Int, limits: [Limit], selectedKind: String,
          compactOn: Bool, skinID: String, petCount: Int) {
         self.usedPercent = usedPercent
@@ -2095,6 +2279,7 @@ final class BattleView: NSView {
         animTimer = nil
         guard window != nil else { return }
         pickBugTarget()
+        startSparkle()          // the shiny announces itself on entry; no-op otherwise
         animTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
             self?.step()
         }
@@ -2124,11 +2309,26 @@ final class BattleView: NSView {
         bugOffset = NSPoint(x: bugOffset.x + dx * 0.085, y: bugOffset.y + dy * 0.085)
         if abs(dx) + abs(dy) < 1.5 { pickBugTarget() }
 
+        // The sparkle animates on its own clock, so it has to force repaints for
+        // its whole run — otherwise a still frame (no bob, no drift) would freeze
+        // it mid-burst. Clear it when done so we stop repainting for nothing.
+        var sparkling = false
+        if let s = sparkleStart {
+            if Date().timeIntervalSince(s) > SPARKLE_DURATION { sparkleStart = nil }
+            else { sparkling = true }
+        }
+
+        // The barker expires on a clock too, and its last frame needs one repaint
+        // to clear — without this it would linger until the next bob happened to
+        // trigger a redraw.
+        var flashExpired = false
+        if let u = flashUntil, Date() >= u { flashUntil = nil; flashExpired = true }
+
         // draw(_:) repaints the whole panel (the rounded background makes a
         // partial repaint fiddly), so only ask for one when something moved.
         let moved = newBob != bob || abs(dx) + abs(dy) > 0.05
         bob = newBob
-        if moved { needsDisplay = true }
+        if moved || sparkling || flashExpired { needsDisplay = true }
     }
 
     deinit { animTimer?.invalidate() }
@@ -2261,15 +2461,25 @@ final class BattleView: NSView {
         let pSize = spriteSize(pGrid, cell: pCell)
         let pField = NSRect(x: area.minX, y: area.minY,
                             width: playerBox.minX - area.minX, height: enemyBox.minY - area.minY)
-        drawSprite(pGrid, origin: NSPoint(x: pField.midX - pSize.width / 2,
-                                          y: pField.midY - pSize.height / 2 - 45 + bob),
-                   cell: pCell, colors: skinColors)
+        let pOrigin = NSPoint(x: pField.midX - pSize.width / 2,
+                              y: pField.midY - pSize.height / 2 - 45 + bob)
+        drawSprite(pGrid, origin: pOrigin, cell: pCell, colors: skinColors)
+        playerSpriteRect = NSRect(origin: pOrigin, size: pSize)
 
         drawIndicator(enemyBox, name: BATTLE_ENEMY_NAME, level: BATTLE_ENEMY_LEVEL,
                       frac: 1, isPlayer: false)
         let remaining = max(0, min(100, 100 - usedPercent))
-        drawIndicator(playerBox, name: "클로드", level: usedPercent,
+        // The ★ rides on the name so it inherits the indicator's layout. The name
+        // is the shortest field there, so the extra glyph has room; see
+        // docs/battle-ui.md before adding anything wider.
+        drawIndicator(playerBox, name: isShiny ? "클로드\(SHINY_MARK)" : "클로드", level: usedPercent,
                       frac: CGFloat(remaining) / 100, isPlayer: true, remaining: remaining)
+
+        // Sparkles last, so they sit over the sprite and the indicators both.
+        if let s = sparkleStart, isShiny {
+            let t = Date().timeIntervalSince(s) / SPARKLE_DURATION
+            drawSparkles(in: playerSpriteRect, t: t, gold: SHINY_GOLD)
+        }
     }
 
     /// Gen-2 indicator: name (larger) + level (smaller) on one baseline, a thin
@@ -2455,6 +2665,13 @@ final class BattleView: NSView {
                 ("✓" as NSString).draw(at: NSPoint(x: cell.minX + 8, y: cell.maxY - 22),
                                        withAttributes: [.font: pixelFont(15), .foregroundColor: GB_INK])
             }
+            // A rare skin keeps a gold ★ in its cell once earned — opposite corner
+            // from the ✓, so a selected shiny shows both without them colliding.
+            if s.isRare && unlocked {
+                (SHINY_MARK as NSString).draw(at: NSPoint(x: cell.maxX - 22, y: cell.maxY - 22),
+                                              withAttributes: [.font: pixelFont(15),
+                                                               .foregroundColor: SHINY_GOLD])
+            }
         }
     }
 
@@ -2475,11 +2692,26 @@ final class BattleView: NSView {
 
         let font = pixelFont(Self.itemFontSize)
         let attr: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: GB_INK]
-        // The message sits on the same baseline as the menu's top row, not the
-        // box's vertical center, so the two columns read as one line of text.
-        let msg = screen.message as NSString
-        let mh = msg.size(withAttributes: attr).height
-        msg.draw(at: NSPoint(x: box.minX + 16, y: itemRect(0).midY - mh / 2), withAttributes: attr)
+
+        if flashing {
+            // The barker uses both menu rows' worth of height, so it is centered on
+            // the pair of baselines rather than on the top row alone.
+            let lineH = ("가" as NSString).size(withAttributes: attr).height
+            let gap: CGFloat = 4
+            let block = lineH * CGFloat(flashLines.count) + gap * CGFloat(flashLines.count - 1)
+            let midY = (itemRect(0).midY + itemRect(2).midY) / 2
+            var y = midY + block / 2 - lineH
+            for line in flashLines {
+                (line as NSString).draw(at: NSPoint(x: box.minX + 16, y: y), withAttributes: attr)
+                y -= lineH + gap
+            }
+        } else {
+            // The message sits on the same baseline as the menu's top row, not the
+            // box's vertical center, so the two columns read as one line of text.
+            let msg = screen.message as NSString
+            let mh = msg.size(withAttributes: attr).height
+            msg.draw(at: NSPoint(x: box.minX + 16, y: itemRect(0).midY - mh / 2), withAttributes: attr)
+        }
 
         let dim: [NSAttributedString.Key: Any] = [.font: font,
                                                   .foregroundColor: GB_INK.withAlphaComponent(0.30)]
@@ -2571,6 +2803,10 @@ final class BattleView: NSView {
         if hpClicks >= LADYBUG_CLICKS {
             hpClicks = 0
             ladybug.toggle()
+            flashLines = ladybug
+                ? ["..... 오잉?!", "버그의 상태가.....!"]
+                : ["..... 어라?", "버그가 원래대로 돌아왔다!"]
+            flashUntil = Date().addingTimeInterval(LADYBUG_FLASH_HOLD)
             needsDisplay = true
         }
         return true
