@@ -249,16 +249,13 @@ struct ClawdSkin {
 /// How many pets unlock the shiny.
 let PETS_TO_SHINY = 50
 
-/// Six variants, to fill a Pokémon-style party screen: the default, the shiny
-/// (locked), and one per model theme. Colors are original recolors of our own
-/// sprite, not taken from any existing game's data.
+/// Six variants, to fill a Pokémon-style party screen: the default and the four
+/// model themes, then the shiny last — it is the rare one, so it sits at the end
+/// of the party (bottom-right of the 2x3 picker) rather than beside the default.
+/// Colors are original recolors of our own sprite, not from any existing game.
 let ALL_SKINS: [ClawdSkin] = [
     ClawdSkin(id: "default", name: "클로드",
               highlight: rgb(0xF5,0xB8,0x95), base: rgb(0xD9,0x77,0x57), shadow: rgb(0xA6,0x47,0x2E)),
-    ClawdSkin(id: "shiny", name: "이로치",
-              highlight: rgb(0xFC,0xF0,0xC0), base: rgb(0xF0,0xC2,0x52), shadow: rgb(0xBE,0x86,0x2E),
-              unlockPets: PETS_TO_SHINY,
-              outlineOverride: rgb(0x6B,0x45,0x0E)),   // warm gold-brown, not the derived near-black
     ClawdSkin(id: "opus", name: "오퍼스",
               highlight: rgb(0xCF,0xAC,0xF0), base: rgb(0x88,0x58,0xB0), shadow: rgb(0x57,0x30,0x80)),
     ClawdSkin(id: "sonnet", name: "소네트",
@@ -267,6 +264,10 @@ let ALL_SKINS: [ClawdSkin] = [
               highlight: rgb(0xB4,0xEE,0xB0), base: rgb(0x58,0xB0,0x5A), shadow: rgb(0x30,0x80,0x36)),
     ClawdSkin(id: "fable", name: "페이블",
               highlight: rgb(0xFA,0xC2,0xE0), base: rgb(0xD8,0x60,0xA0), shadow: rgb(0xA0,0x38,0x70)),
+    ClawdSkin(id: "shiny", name: "이로치",
+              highlight: rgb(0xFC,0xF0,0xC0), base: rgb(0xF0,0xC2,0x52), shadow: rgb(0xBE,0x86,0x2E),
+              unlockPets: PETS_TO_SHINY,
+              outlineOverride: rgb(0x6B,0x45,0x0E)),   // warm gold-brown, not the derived near-black
 ]
 
 func skin(id: String) -> ClawdSkin { ALL_SKINS.first { $0.id == id } ?? ALL_SKINS[0] }
@@ -903,8 +904,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.alert("업데이트 확인 실패", "네트워크 상태를 확인해 주세요.")
                 } else if !newer {
                     self.alert("최신 버전입니다", "현재 버전 \(APP_VERSION)")
+                } else {
+                    // A hand-triggered check needs an answer on the spot. Rebuilding
+                    // the menu adds the 🎁 item, but the menu the user just clicked
+                    // is already drawn, so silently doing nothing reads as a no-op.
+                    self.installUpdateNow()
                 }
-                // If newer, the menu now shows the update item — no popup needed.
             }
         }
     }
@@ -2787,7 +2792,16 @@ final class BattleView: NSView {
 
     override func mouseDown(with e: NSEvent) {
         if tapEnemyHP(e) { return }
-        hover(e); activate()
+        hover(e)
+        // A click only fires the cell it actually landed in. activate() runs off
+        // the cursor, which suits the keyboard (arrows move it, Enter fires it) —
+        // but for the mouse the cursor may be parked on a cell far from the click,
+        // so clicking the message area or empty space would otherwise trigger it.
+        let p = convert(e.locationInWindow, from: nil)
+        let onCell = (screen == .skins)
+            ? skinCells.indices.contains { skinRect($0).contains(p) }
+            : items.indices.contains { itemRect($0).contains(p) && items[$0].enabled }
+        if onCell { activate() }
     }
 
     /// Easter egg. The enemy's HP plate sits in the battle area, where no menu
