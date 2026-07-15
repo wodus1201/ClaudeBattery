@@ -2805,7 +2805,7 @@ final class BattleView: NSView {
             ladybug.toggle()
             flashLines = ladybug
                 ? ["..... 오잉?!", "버그의 상태가.....!"]
-                : ["..... 어라?", "버그가 원래대로 돌아왔다!"]
+                : ["..... 어라?", "원래대로 돌아왔다!"]
             flashUntil = Date().addingTimeInterval(LADYBUG_FLASH_HOLD)
             needsDisplay = true
         }
