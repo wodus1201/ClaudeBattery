@@ -1446,10 +1446,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// the only way to quit, so it must stay reachable even if the panel breaks.
     @objc func buttonClicked(_ sender: NSStatusBarButton) {
         let event = NSApp.currentEvent
-        let inSprite = event.map { ev -> Bool in
-            let p = sender.convert(ev.locationInWindow, from: nil)
-            return p.x <= spriteHitMaxX
-        } ?? false
+        // sendAction(on:) synthesizes the event, so locationInWindow is the
+        // button's center, not the mouse. Ask the system where the cursor is.
+        let inSprite: Bool = {
+            guard let win = sender.window else { return false }
+            let screenP = NSEvent.mouseLocation
+            let winP = win.convertPoint(fromScreen: screenP)
+            let p = sender.convert(winP, from: nil)
+            // spriteHitMaxX is in image coordinates; .imageOnly centers the
+            // image in the button, so shift by the leftover margin.
+            let originX = (sender.bounds.width - (sender.image?.size.width ?? sender.bounds.width)) / 2
+            return p.x >= originX && p.x - originX <= spriteHitMaxX
+        }()
         let isRightClick = event.map {
             $0.type == .rightMouseUp || $0.modifierFlags.contains(.control)
         } ?? false
