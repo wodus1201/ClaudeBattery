@@ -1243,7 +1243,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let hpLabel = "HP:"
         let hpText = hpUnknown ? "--/100" : "\(remaining)/100"
 
-        let nameAttr: [NSAttributedString.Key: Any] = [.font: pixelFont(15), .foregroundColor: black]
+        // Compact mode shrinks the name too — on a 14" menu bar every point counts.
+        let nameAttr: [NSAttributedString.Key: Any] = [.font: pixelFont(compact ? 12 : 15), .foregroundColor: black]
         let lvAttr: [NSAttributedString.Key: Any]   = [.font: pixelFont(12), .foregroundColor: black]
         let hpTextAttr: [NSAttributedString.Key: Any] = [.font: pixelFont(13), .foregroundColor: black]
         let hpLabelAttr: [NSAttributedString.Key: Any] = [.font: pixelFont(10), .foregroundColor: NSColor.systemYellow]
@@ -1274,10 +1275,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let hpUnitW = hpLabelSize.width + 8 + 54     // label part + gauge part
         let gaugePartW: CGFloat = 54
         let unitH: CGFloat = 13
-        let padX: CGFloat = 7
-        let gap: CGFloat = 5
-        let spriteNameGap: CGFloat = 7   // 스프라이트 ↔ 이름 간격 (이 숫자를 키우면 더 벌어짐)
-        let flavorGap: CGFloat = 10
+        // Compact mode tightens the spacing to match its smaller text — at 9pt the
+        // roomier gaps read as gaps, not breathing room.
+        let padX: CGFloat = compact ? 5 : 7
+        let gap: CGFloat = compact ? 4 : 5
+        let spriteNameGap: CGFloat = compact ? 5 : 7   // 스프라이트 ↔ 이름 간격 (이 숫자를 키우면 더 벌어짐)
+        let flavorGap: CGFloat = compact ? 7 : 10
         let height = NSStatusBar.system.thickness
 
         let lvBlockW = compact ? 0 : lvSize.width + gap   // Lv text + its trailing gap, omitted when compact
