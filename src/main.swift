@@ -1753,7 +1753,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(.separator())
         }
 
-        let compactItem = NSMenuItem(title: "간결 모드 (메뉴바 폭 줄이기)",
+        let compactItem = NSMenuItem(title: "좁게 보기 (메뉴바 폭 줄이기)",
                                      action: #selector(toggleCompact), keyEquivalent: "")
         compactItem.target = self
         compactItem.state = compact ? .on : .off
@@ -1810,7 +1810,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(.separator())
         if showCompactToggle {
-            let compactItem = NSMenuItem(title: "간결 모드 (메뉴바 폭 줄이기)",
+            let compactItem = NSMenuItem(title: "좁게 보기 (메뉴바 폭 줄이기)",
                                          action: #selector(toggleCompact), keyEquivalent: "")
             compactItem.target = self
             compactItem.state = compact ? .on : .off
@@ -2204,7 +2204,7 @@ final class BattleView: NSView {
     var limits: [Limit]
     /// Which limit is tracked right now (a `kind`).
     var selectedKind: String
-    /// Whether compact mode is on — drawn as a ✓ next to 간결 모드.
+    /// Whether compact mode is on — flips the 좁게 보기/넓게 보기 label.
     var compactOn: Bool
     /// The chosen skin's id, and how many pets so far (gates the shiny).
     var skinID: String
@@ -2238,6 +2238,9 @@ final class BattleView: NSView {
     /// widget's sprite hitbox uses) so mouseDown can hit-test it without
     /// recomputing the indicator layout.
     private var enemyHPRect = NSRect.zero
+    /// The skin picker's top-right "뒤로가다" button, recorded while drawing so
+    /// mouseDown can hit-test it (the picker has no 2x2 cell for going back).
+    private var skinBackRect = NSRect.zero
     private var hpClicks = 0
     /// Purely cosmetic and deliberately not persisted: closing the panel resets
     /// the bug, so finding it again is part of the joke.
@@ -2367,7 +2370,7 @@ final class BattleView: NSView {
     /// column's text sits flush against the container's border.
     ///
     /// These numbers are load-bearing together, alongside BATTLE_W: the longest
-    /// label ("사용량 선택" / "간결 모드 ✓", ~90pt at 16pt) must fit in
+    /// label ("사용량 선택" / "색상 커스텀", ~90pt at 16pt) must fit in
     ///   cellWidth - (cellPadX + cursorW) - cellPadX
     /// while the longest message ("어떤 한도를 볼까?", ~136pt) still fits the
     /// left area. Both clear by only a few points — widen the cursor gap or the
@@ -2409,7 +2412,7 @@ final class BattleView: NSView {
             return out
         case .more:
             return [
-                BattleItem(title: compactOn ? "간결 모드 ✓" : "간결 모드", action: .toggleCompact),
+                BattleItem(title: compactOn ? "넓게 보기" : "좁게 보기", action: .toggleCompact),
                 BattleItem(title: "버전 확인", action: .checkUpdate),
                 BattleItem(title: "색상 커스텀", action: .openSkins),
                 BattleItem(title: "뒤로가다", action: .back),
@@ -2659,12 +2662,16 @@ final class BattleView: NSView {
         let th = title.size(withAttributes: titleAttr).height
         title.draw(at: NSPoint(x: bounds.minX + 18, y: bounds.maxY - 12 - th), withAttributes: titleAttr)
 
-        let hint = "Esc: 뒤로" as NSString
-        let hintAttr: [NSAttributedString.Key: Any] = [.font: pixelFont(12),
-                                                       .foregroundColor: GB_INK.withAlphaComponent(0.5)]
-        let hs = hint.size(withAttributes: hintAttr)
-        hint.draw(at: NSPoint(x: bounds.maxX - 18 - hs.width, y: bounds.maxY - 12 - hs.height),
-                  withAttributes: hintAttr)
+        // Top-right back button — clickable (and still Esc-able). The picker has
+        // no 2x2 grid, so this is the in-UI way out.
+        let back = "◀ 뒤로가다" as NSString
+        let backAttr: [NSAttributedString.Key: Any] = [.font: pixelFont(13), .foregroundColor: GB_INK]
+        let bs = back.size(withAttributes: backAttr)
+        let backOrigin = NSPoint(x: bounds.maxX - 18 - bs.width, y: bounds.maxY - 12 - bs.height)
+        back.draw(at: backOrigin, withAttributes: backAttr)
+        // Pad the hit area so the whole word is comfortably clickable.
+        skinBackRect = NSRect(x: backOrigin.x - 6, y: backOrigin.y - 4,
+                              width: bs.width + 12, height: bs.height + 8)
 
         let miniGrid = spriteGrids[.healthy]![0]
         let miniCell: CGFloat = 2.6
@@ -2817,12 +2824,14 @@ final class BattleView: NSView {
 
     override func mouseDown(with e: NSEvent) {
         if tapEnemyHP(e) { return }
+        let p = convert(e.locationInWindow, from: nil)
+        // The skin picker's back button leaves the picker — same as Esc.
+        if screen == .skins && skinBackRect.contains(p) { go(to: .root); return }
         hover(e)
         // A click only fires the cell it actually landed in. activate() runs off
         // the cursor, which suits the keyboard (arrows move it, Enter fires it) —
         // but for the mouse the cursor may be parked on a cell far from the click,
         // so clicking the message area or empty space would otherwise trigger it.
-        let p = convert(e.locationInWindow, from: nil)
         let onCell = (screen == .skins)
             ? skinCells.indices.contains { skinRect($0).contains(p) }
             : items.indices.contains { itemRect($0).contains(p) && items[$0].enabled }
