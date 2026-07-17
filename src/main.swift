@@ -1576,7 +1576,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case .quit:
             closeBattlePanel()
             NSApp.terminate(nil)
-        case .openUsage, .openMore, .openSkins, .back, .none:
+        case .openUsage, .openMore, .openSkins, .openBattle, .back, .none:
             break                            // handled inside the view
         }
     }
@@ -1869,7 +1869,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ]
         // All menu pages, stacked, so a design change can be checked at once.
         // The skin picker is shown with the shiny unlocked so its cell renders.
-        let pages: [BattleScreen] = [.root, .usage, .more, .skins]
+        let pages: [BattleScreen] = [.root, .battle, .usage, .more, .skins]
         let gap: CGFloat = 10
         let size = NSSize(width: BATTLE_W, height: (BATTLE_H + gap) * CGFloat(pages.count) - gap)
         let img = NSImage(size: size, flipped: false) { rect in
@@ -2160,19 +2160,19 @@ let BATTLE_W: CGFloat = 480
 let BATTLE_H: CGFloat = 300
 
 let BATTLE_ENEMY_NAME  = "버그"
-let BATTLE_ENEMY_LEVEL = 50
 
 /// Which page of the 2x2 menu is showing. Choosing 사용량/기능 swaps only the
 /// dialogue box; the battle scene above it stays put.
 enum BattleScreen {
-    case root, usage, more, skins
+    case root, usage, more, skins, battle
 
     var message: String {
         switch self {
-        case .root:  return "무엇을 할까?"
-        case .usage: return "어떤 한도를 볼까?"
-        case .more:  return "어떤 걸 해볼까?"
-        case .skins: return "누구로 바꿀까?"
+        case .root:   return "무엇을 할까?"
+        case .usage:  return "어떤 한도를 볼까?"
+        case .more:   return "어떤 걸 해볼까?"
+        case .skins:  return "누구로 바꿀까?"
+        case .battle: return "무엇을 할까?"
         }
     }
 }
@@ -2185,7 +2185,7 @@ struct BattleItem {
 }
 
 enum BattleAction {
-    case openUsage, openMore, openSkins, back
+    case openUsage, openMore, openSkins, openBattle, back
     case pickLimit(String)      // limit `kind`
     case pickSkin(String)       // skin `id`
     case toggleCompact
@@ -2263,6 +2263,12 @@ final class BattleView: NSView {
     /// over it without recomputing the battle-area layout.
     private var playerSpriteRect = NSRect.zero
     var isShiny: Bool { skin(id: skinID).isRare }
+
+    /// The enemy bug's level and remaining HP fraction, rolled fresh each time a
+    /// battle panel opens (a new BattleView is built per open). Purely cosmetic —
+    /// unrelated to the account's real usage, which only drives the player's side.
+    let enemyLevel = Int.random(in: 2...60)
+    let enemyFrac = CGFloat.random(in: 0.2...1.0)
 
     func startSparkle() {
         guard isShiny else { return }
@@ -2377,10 +2383,18 @@ final class BattleView: NSView {
         switch screen {
         case .root:
             return [
+                BattleItem(title: "싸우다", action: .openBattle),
                 BattleItem(title: "사용량 선택", action: .openUsage),
-                BattleItem(title: "색상 커스텀", action: .openSkins),
-                BattleItem(title: "기능 더보기", action: .openMore),
-                BattleItem(title: "종료하기", action: .quit),
+                BattleItem(title: "더보기", action: .openMore),
+                BattleItem(title: "종료하다", action: .quit),
+            ]
+        case .battle:
+            // Placeholder submenu — items to be decided later.
+            return [
+                BattleItem(title: "—", action: .none, enabled: false),
+                BattleItem(title: "—", action: .none, enabled: false),
+                BattleItem(title: "—", action: .none, enabled: false),
+                BattleItem(title: "뒤로가다", action: .back),
             ]
         case .usage:
             let order = ["session", "weekly_all", "weekly_scoped"]
@@ -2391,14 +2405,14 @@ final class BattleView: NSView {
                 BattleItem(title: shortLabel(for: $0), action: .pickLimit($0.kind))
             }
             while out.count < 3 { out.append(BattleItem(title: "—", action: .none, enabled: false)) }
-            out.append(BattleItem(title: "뒤로", action: .back))
+            out.append(BattleItem(title: "뒤로가다", action: .back))
             return out
         case .more:
             return [
                 BattleItem(title: compactOn ? "간결 모드 ✓" : "간결 모드", action: .toggleCompact),
                 BattleItem(title: "버전 확인", action: .checkUpdate),
-                BattleItem(title: "새로고침", action: .refresh),
-                BattleItem(title: "뒤로", action: .back),
+                BattleItem(title: "색상 커스텀", action: .openSkins),
+                BattleItem(title: "뒤로가다", action: .back),
             ]
         case .skins:
             return []   // the skin picker draws its own grid, not a 2x2 menu
@@ -2482,8 +2496,8 @@ final class BattleView: NSView {
         drawSprite(pGrid, origin: pOrigin, cell: pCell, colors: skinColors)
         playerSpriteRect = NSRect(origin: pOrigin, size: pSize)
 
-        drawIndicator(enemyBox, name: BATTLE_ENEMY_NAME, level: BATTLE_ENEMY_LEVEL,
-                      frac: 1, isPlayer: false)
+        drawIndicator(enemyBox, name: BATTLE_ENEMY_NAME, level: enemyLevel,
+                      frac: enemyFrac, isPlayer: false)
         let remaining = max(0, min(100, 100 - usedPercent))
         // The ★ rides on the name so it inherits the indicator's layout. The name
         // is the shortest field there, so the extra glyph has room; see
@@ -2861,10 +2875,11 @@ final class BattleView: NSView {
         let all = items
         guard all.indices.contains(cursor), all[cursor].enabled else { return }
         switch all[cursor].action {
-        case .openUsage: go(to: .usage)
-        case .openMore:  go(to: .more)
-        case .openSkins: go(to: .skins)
-        case .back:      go(to: .root)
+        case .openUsage:  go(to: .usage)
+        case .openMore:   go(to: .more)
+        case .openSkins:  go(to: .skins)
+        case .openBattle: go(to: .battle)
+        case .back:       go(to: .root)
         case .none:      break
         default:         perform(all[cursor].action)
         }
