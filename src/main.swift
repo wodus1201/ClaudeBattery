@@ -2524,6 +2524,64 @@ final class BattleView: NSView {
     /// bottom rule (~5x thinner) ending in a half-arrowhead. The player's is
     /// mirrored, and carries big HP numbers plus a container-less exp bar that
     /// fills right-to-left.
+    /// A GB-style half-arrowhead built from stacked pixel rows instead of a smooth
+    /// triangle, so its hypotenuse steps like the reference sprite. The tip keeps a
+    /// 1px stub rather than a needle point, giving the rounded-off look.
+    /// `baseX` is the vertical (base) edge; the tip sits `w` away toward `tipDir`
+    /// (+1 = tip to the right, -1 = tip to the left). Rows stack up from `y`.
+    private func drawPixelArrow(baseX: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat, tipDir: CGFloat) {
+        let px: CGFloat = 1.375           // one "pixel" — matches the sprite cell feel
+        let rows = max(1, Int((h / px).rounded()))
+        let stub: CGFloat = px            // blunt tip: shortest row is 1px wide, not 0
+        for r in 0..<rows {
+            // Bottom row is full width (w); each row up loses a step, down to the stub.
+            let t = CGFloat(r) / CGFloat(rows)
+            let rowW = max(stub, w * (1 - t))
+            let rowY = y + CGFloat(r) * px
+            let rowX = tipDir > 0 ? baseX : baseX - rowW
+            NSRect(x: rowX, y: rowY, width: rowW, height: px).fill()
+        }
+    }
+
+    enum Corner { case bottomLeft, topRight, bottomRight }
+
+    /// Rounds one corner of a filled shape by painting stepped pixel triangles in
+    /// the background color — the same staircase look as drawPixelArrow, but
+    /// subtractive. `x,y` is the corner origin; `size` is the band thickness so the
+    /// notch scales with it. Must run inside the same non-antialiased context, and
+    /// the current fill color is overwritten (caller re-sets ink if needed).
+    private func drawCornerNotch(x: CGFloat, y: CGFloat, size: CGFloat, corner: Corner) {
+        let px: CGFloat = 1.375
+        let steps = max(1, Int((size * 0.5 / px).rounded()))   // notch ~half the thickness
+        GB_BG.setFill()
+        for s in 0..<steps {
+            let cut = CGFloat(steps - s) * px      // widest cut at the very corner
+            let off = CGFloat(s) * px
+            switch corner {
+            case .bottomLeft:
+                NSRect(x: x, y: y + off, width: cut, height: px).fill()
+            case .topRight:
+                NSRect(x: x + size - cut, y: y - off - px, width: cut, height: px).fill()
+            case .bottomRight:
+                NSRect(x: x + size - cut, y: y + off, width: cut, height: px).fill()
+            }
+        }
+    }
+
+    /// 계단식으로 안쪽 코너를 채운다(둥근 안쪽 모서리). x,y는 코너 기준점,
+    /// 좌측 위에서 우측 아래로 내려오는 계단을 GB_INK로 그린다.
+    private func drawCornerFill(x: CGFloat, y: CGFloat, size: CGFloat) {
+        let px: CGFloat = 1.375
+        let steps = max(1, Int((size * 0.5 / px).rounded()))
+        GB_INK.setFill()
+        for s in 0..<steps {
+            let w = CGFloat(steps - s) * px       // 위로 갈수록 넓게
+            let rowY = y + CGFloat(s) * px         // 코너에서 아래로 쌓기
+            NSRect(x: x, y: rowY, width: w, height: px).fill()
+        }
+    }
+
+
     private func drawIndicator(_ box: NSRect, name: String, level: Int, frac: CGFloat,
                                isPlayer: Bool, remaining: Int = 0) {
         let title = NSMutableAttributedString(string: name,
@@ -2533,10 +2591,15 @@ final class BattleView: NSView {
         let ts = title.size()
 
         let bandW: CGFloat = 9.5
-        let lineH: CGFloat = 2.5
-        let arrowW: CGFloat = 11
+        let lineH: CGFloat = 2       // bottom rule; integer so both indicators' rules
+                                     // land on the same pixel weight (no subpixel drift)
+        let arrowW: CGFloat = 13.75  // 1.25× the old 11
         let arrowH: CGFloat = 8
         let lineY = box.minY
+        // Player-only: a black connector strip where the right vertical band meets
+        // the HP bar (top) and the exp/arrow line (bottom). Each strip is this wide
+        // and overlays the bar, so both gauges lose this much of their full width.
+        let junctionW: CGFloat = 5
 
         let unitH: CGFloat = 12
         let unitY = box.maxY - ts.height - unitH - 2
@@ -2559,14 +2622,24 @@ final class BattleView: NSView {
         NSGraphicsContext.current?.shouldAntialias = false
         GB_INK.setFill(); unit.fill()
         // The enemy's track stops short, leaving the thick black cap on its right.
-        let trackR: CGFloat = isPlayer ? 1.5 : 4
-        let track = NSRect(x: unit.minX + labelW, y: unit.minY + 1.5,
-                           width: unit.width - labelW - trackR, height: unitH - 3)
-        NSColor.white.setFill(); track.fill()
+        // The player's right margin is junctionW: the unit is black full-height, so
+        // that margin reads as the top connector strip, and the gauge stops before it.
+        let trackR: CGFloat = isPlayer ? junctionW : 8   // enemy cap doubled (was 4)
+        // The track background is GB_BG, not white, so the empty part of the gauge
+        // and the padding above/below it read as "no track" — the colored gauge
+        // just floats on the panel. It flushes to the unit's TOP so no black rule
+        // shows above; a thin black rule remains below. The colored gauge inside is
+        // 0.75× the old height (9→6.75) and centered in the track.
+        let trackX = unit.minX + labelW
+        let trackW = unit.width - labelW - trackR
+        let track = NSRect(x: trackX, y: unit.minY + 1.5,
+                           width: trackW, height: unitH - 1.5)   // top flush, ~1.5 below
+        GB_BG.setFill(); track.fill()
         if frac > 0 {
+            let gaugeH: CGFloat = (unitH - 3) * 0.75 * 0.75   // thinned once more (0.75×)
             gaugeColor(frac).setFill()
-            NSRect(x: track.minX, y: track.minY,
-                   width: track.width * frac, height: track.height).fill()
+            NSRect(x: track.minX, y: track.minY + (track.height - gaugeH) / 2,
+                   width: track.width * frac, height: gaugeH).fill()
         }
         NSGraphicsContext.current?.restoreGraphicsState()
 
@@ -2589,29 +2662,58 @@ final class BattleView: NSView {
         NSGraphicsContext.current?.shouldAntialias = false
         GB_INK.setFill()
         if isPlayer {
-            NSRect(x: box.maxX - bandW, y: lineY, width: bandW, height: unit.maxY - lineY).fill()
+            let pBandX = box.maxX - bandW
+            NSRect(x: pBandX, y: lineY, width: bandW, height: unit.maxY - lineY).fill()
             let tipX = box.minX - 6
             NSRect(x: tipX + arrowW, y: lineY, width: box.maxX - (tipX + arrowW), height: lineH).fill()
-            let arrow = NSBezierPath()
-            arrow.move(to: NSPoint(x: tipX + arrowW, y: lineY))
-            arrow.line(to: NSPoint(x: tipX + arrowW, y: lineY + arrowH))
-            arrow.line(to: NSPoint(x: tipX, y: lineY))
-            arrow.close(); arrow.fill()
+            // Tip points left; base edge sits at tipX + arrowW.
+            drawPixelArrow(baseX: tipX + arrowW, y: lineY, w: arrowW, h: arrowH, tipDir: -1)
+            // Round the band's outer (right) corners, top and bottom.
+            drawCornerNotch(x: pBandX, y: unit.maxY, size: bandW, corner: .topRight)
+            drawCornerNotch(x: pBandX, y: lineY, size: bandW, corner: .bottomRight)
+            GB_INK.setFill()   // notch left GB_BG selected; restore for the exp bar path below
+            // Bottom connector strip: black, junctionW wide, arrowhead-tall, flush to
+            // the band's left edge. Overlays the line/exp area at the junction.
+            NSRect(x: pBandX - junctionW, y: lineY, width: junctionW, height: arrowH).fill()
             let expX = tipX + arrowW + 2
+            // Exp bar total width loses junctionW so its right edge sits flush
+            // against the strip's left edge (pBandX - junctionW).
             let exp = NSRect(x: expX, y: lineY + lineH + 2,
-                             width: (box.maxX - bandW) - expX - 1, height: 4)
+                             width: (box.maxX - bandW) - expX - junctionW, height: 4)
             GB_EXP.setFill()
             NSRect(x: exp.maxX - exp.width * 0.55, y: exp.minY,
                    width: exp.width * 0.55, height: exp.height).fill()
         } else {
-            NSRect(x: box.minX, y: lineY, width: bandW, height: unit.maxY - lineY).fill()
-            let endX = box.maxX + 6
-            NSRect(x: box.minX, y: lineY, width: (endX - arrowW) - box.minX, height: lineH).fill()
-            let arrow = NSBezierPath()
-            arrow.move(to: NSPoint(x: endX - arrowW, y: lineY))
-            arrow.line(to: NSPoint(x: endX - arrowW, y: lineY + arrowH))
-            arrow.line(to: NSPoint(x: endX, y: lineY))
-            arrow.close(); arrow.fill()
+            // Enemy bracket: a vertical band on the LEFT (outside the HP bar so it
+            // never covers the "HP:" cap), a bottom rule, and an arrowhead on the
+            // right — joined as one right-angled ⌐ shape.
+            let bandGap: CGFloat = 4
+            let eBandW = bandW * 0.75           // thinner band (0.75×)
+            let eBandH = (unit.maxY - lineY) * 1.25   // taller band (1.25×)
+            let bandX = box.minX - bandGap      // original left position (clears "HP:")
+            let eBandBottom = (unit.maxY - eBandH).rounded()   // pixel-align the rule
+            // Arrowhead base aligns with the HP bar's right edge (unit.maxX): the
+            // triangle sits directly under the gauge's end, not past the box.
+            let endX = unit.maxX + arrowW
+            // Bottom rule spans from ruleX to the arrowhead's base. ruleX is the
+            // horizontal start of the rule ONLY — decoupled from bandX so the rule
+            // can slide right to meet the band's right edge without dragging the
+            // vertical band with it. Draw the rule FIRST at eBandBottom with pure
+            // lineH, then the band stops just above it (its bottom == rule's top) so
+            // the band never stacks onto the rule and thickens it.
+            // Rule and band share bandX, so the band, rule, and stepped notch all
+            // align on the same left edge — no overhang. ruleX stays separate only
+            // so the rule's start can be nudged later without moving the band.
+            let ruleX = bandX + 6.5
+            NSRect(x: ruleX, y: eBandBottom + 1, width: (endX - arrowW) - ruleX, height: lineH).fill()
+            NSRect(x: bandX, y: eBandBottom + lineH,
+                   width: eBandW, height: eBandH - lineH).fill()
+            // Tip points right; base edge sits at endX - arrowW, on the same rule.
+            drawPixelArrow(baseX: endX - arrowW, y: eBandBottom + 1, w: arrowW, h: arrowH, tipDir: 1)
+            // Restore the stepped, rounded bottom-left corner of the band.
+            drawCornerNotch(x: bandX, y: eBandBottom + lineH, size: eBandW, corner: .bottomLeft)
+            drawCornerFill(x: bandX + eBandW, y: eBandBottom + lineH, size: eBandW + 3)
+            GB_INK.setFill()
         }
         // Restore, or the dialog box's curves drawn next come out jagged too.
         NSGraphicsContext.current?.restoreGraphicsState()
