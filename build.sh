@@ -38,16 +38,19 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# All Swift sources compile together as one module (no imports between them).
+SOURCES=$(find src -name '*.swift' | sort)
+
 if [ "$UNIVERSAL" = "1" ]; then
   echo "Compiling (universal: arm64 + x86_64)…"
   TMP="$(mktemp -d)"
   trap 'rm -rf "$TMP"' EXIT
-  swiftc -O -target arm64-apple-macos13  src/main.swift -o "$TMP/arm64"
-  swiftc -O -target x86_64-apple-macos13 src/main.swift -o "$TMP/x86_64"
+  swiftc -O -target arm64-apple-macos13  $SOURCES -o "$TMP/arm64"
+  swiftc -O -target x86_64-apple-macos13 $SOURCES -o "$TMP/x86_64"
   lipo -create "$TMP/arm64" "$TMP/x86_64" -output "$BIN"
 else
   echo "Compiling…"
-  swiftc -O src/main.swift -o "$BIN"
+  swiftc -O $SOURCES -o "$BIN"
 fi
 chmod +x "$BIN"
 

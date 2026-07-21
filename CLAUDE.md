@@ -1,10 +1,35 @@
 # ClaudeMonster
 
 macOS 메뉴바에서 Claude 사용 한도를 포켓몬 HP바로 보여주는 개인용 위젯.
-Swift 단일 파일(`src/main.swift`) + 셸 스크립트. 외부 의존성 없음.
+기능별로 나뉜 Swift 소스(`src/**/*.swift`) + 셸 스크립트. 외부 의존성 없음.
+모든 `.swift` 파일은 한 모듈로 함께 컴파일되므로 파일 간 `import`는 없다
+(`build.sh`가 `find src -name '*.swift'`로 전부 넘긴다).
 
 사용법·설치·목 모드 실행법은 [README.md](README.md)에 있다. 이 문서는 코드를
 읽어도 드러나지 않는 제약과, 밟기 쉬운 함정만 적는다.
+
+## 소스 구성
+
+```
+src/
+├── main.swift              진입점 (NSApplication 부팅)
+├── Config.swift            상수·엔드포인트·버전·LEGACY_*
+├── Model.swift             Limit, UsageResult
+├── Presentation.swift      메뉴용 라벨/색/HP·배터리 바
+├── Usage/                  Auth(토큰)·Fetch(사용량)·Update(셀프업데이트)
+├── Sprites/                PixelFont·ClawdSprite(스킨/표정)·Sparkle(이로치)
+├── Text/                   Flavor(대사·슬롯 문자열)
+├── App/                    AppDelegate + 기능별 extension
+│   ├── AppDelegate.swift            상태 프로퍼티·라이프사이클·렌더(buildImage)
+│   ├── AppDelegate+Update.swift     셀프업데이트·온보딩·런치·레거시 정리
+│   ├── AppDelegate+Menu.swift       클릭 라우팅·NSMenu 구성
+│   ├── AppDelegate+Battle.swift     배틀 패널 열기/액션·쓰다듬기
+│   └── AppDelegate+Debug.swift      아이콘/배틀/샘플 PNG 덤프
+└── Battle/                 BattleSprites(그리드/색)·BattleView(패널 UI)
+```
+
+extension은 파일 스코프 `private`을 넘지 못한다 — 다른 extension 파일에서
+부르는 메서드는 `private`이 아니라 기본 접근 수준이어야 한다.
 
 ## 빌드 / 실행
 
@@ -51,7 +76,7 @@ CLAUDEMONSTER_DUMP=/tmp/preview.png ./build/...                  # 창 없이 PN
 
 ## 지뢰
 
-**`LEGACY_*` 상수는 이름을 바꾸면 안 된다.** (`main.swift`, `lib.sh`) 1.2 이전
+**`LEGACY_*` 상수는 이름을 바꾸면 안 된다.** (`Config.swift`, `lib.sh`) 1.2 이전
 이름인 "ClaudeBattery"를 가리키는 **역사적 값**이다. 옛 설치가 남긴 LaunchAgent와
 프로세스를 정리하는 데 쓰이므로, 리네임하면 정리 코드가 조용히 동작을 멈춘다.
 
